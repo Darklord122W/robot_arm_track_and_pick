@@ -1,0 +1,34 @@
+cube_detector:
+  ros__parameters:
+    # ---- topics ----
+    color_topic: /camera/color/image_raw
+    depth_topic: /camera/depth/image_raw
+    info_topic:  /camera/color/camera_info
+
+    # ---- TF / output ----
+    cube_frame_id: cube
+    publish_tf: true
+    publish_debug_image: true
+    warn_on_frame_mismatch: true
+
+    # ---- physical model ----
+    cube_size: 0.025          # 25 mm cube
+    height_min: 0.005         # ignore anything within 5 mm of the table plane
+    height_max_tol: 0.010     # +10 mm slack above the cube height (handles tilt/noise)
+
+    # ---- table-plane RANSAC ----
+    ransac_iters: 200
+    ransac_threshold: 0.004   # m — plane inlier band (Astra Pro depth std ≈ 3-5 mm)
+    ransac_subsample: 4000
+
+    # ---- detection ----
+    edge_refine: true
+    min_score: 0.45           # 0..1; reject low-quality polygons
+
+    # ---- temporal smoothing ----
+    temporal_alpha: 0.4       # higher = more responsive, lower = smoother
+    temporal_max_jump_m: 0.05 # detections jumping more than this reset the filter
+
+    # ---- runtime ----
+    sync_slop: 0.05           # s — color/depth time-sync tolerance
+    processing_period_s: 0.1  # s — minimum interval between detections (≤10 Hz here)

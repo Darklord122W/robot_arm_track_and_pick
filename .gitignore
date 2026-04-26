@@ -1,0 +1,63 @@
+# ROS 2 workspace build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# C/C++
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.lib
+*.dll
+*.dylib
+*.exe
+*.out
+
+# IDE / editor
+# Use **/ so nested .vscode dirs (src/.vscode, src/xarm/.vscode, …) are
+# also covered — anchored ".vscode/..." would only match the repo root.
+**/.vscode/browse.vc.db*
+**/.vscode/ipch/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Colcon
+.colcon/
+
+# Logs / temporary files
+*.log
+*.tmp
+*.bak
+
+# rosbag2 captures
+*.db3
+*.mcap
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key

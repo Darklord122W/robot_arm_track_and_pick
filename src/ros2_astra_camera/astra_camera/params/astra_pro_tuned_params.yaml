@@ -1,0 +1,58 @@
+# Astra Pro params tuned for depth-noise reduction on a static scene.
+# Pairs with launch/astra_pro_tuned.launch.py, which also runs
+# apply_astra_tuning.py to lock exposure/gain and configure laser/LDP/fan.
+#
+# Physical setup checklist (section 1 — you must do these):
+#   - Block direct sunlight (biggest single source of dropouts/flicker)
+#   - Warm up camera 5-10 min before capture (reduces wavy bias on flat surfaces)
+#   - Keep target between 0.6 m and 2.5 m (Astra Pro sweet spot)
+#   - Matte, textured surfaces (avoid glossy / matte-black / translucent)
+#   - Remove other IR sources (other Astras, IR heaters, IR remotes)
+
+camera_name: "camera"
+
+# RGB via UVC (Astra Pro RGB is a Sonix UVC sensor, not OpenNI)
+color_width: 640
+color_height: 480
+color_fps: 30
+enable_color: true
+
+# IR stream off — saves bandwidth. IR-sensor controls still work through
+# the set_depth_* services (same underlying device property).
+ir_width: 640
+ir_height: 480
+ir_fps: 30
+enable_ir: false
+
+depth_width: 640
+depth_height: 480
+depth_fps: 30
+enable_depth: true
+
+# Keep depth in its own optical frame. Set true only if a downstream consumer
+# needs depth already registered to color — hardware D2C reduces effective FOV.
+depth_align: false
+
+serial_number: ""
+number_of_devices: 1
+
+# UVC (RGB) — vid/pid match the Astra Mini / Astra Pro RGB sensor
+uvc_camera.enable: true
+uvc_camera.format: "mjpeg"
+uvc_camera.vid: 0x2bc5
+uvc_camera.pid: 0x0501
+uvc_camera.retry_count: 100
+
+color_roi.x: -1
+color_roi.y: -1
+color_roi.width: -1
+color_roi.height: -1
+depth_roi.x: -1
+depth_roi.y: -1
+depth_roi.width: -1
+depth_roi.height: -1
+
+depth_scale: 1
+publish_tf: true
+tf_publish_rate: 10.0
+reconnect_timeout: 6.0

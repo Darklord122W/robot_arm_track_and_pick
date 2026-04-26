@@ -1,0 +1,23 @@
+ompl:
+  # Tell the 'ompl' planning pipeline to use the OMPL planner plugin
+  planning_plugin: ompl_interface/OMPLPlanner
+
+  # Optional but good defaults: request adapters and bounds error
+  request_adapters: >-
+    default_planner_request_adapters/AddTimeParameterization
+    default_planner_request_adapters/FixWorkspaceBounds
+    default_planner_request_adapters/FixStartStateBounds
+    default_planner_request_adapters/FixStartStateCollision
+    default_planner_request_adapters/FixStartStatePathConstraints
+  start_state_max_bounds_error: 0.1
+
+  # OMPL planner configurations
+  planner_configs:
+    RRTConnectkConfigDefault:
+      type: geometric::RRTConnect
+      range: 0.0
+
+# Assign planner config to your group
+arm:
+  planner_configs:
+    - RRTConnectkConfigDefault

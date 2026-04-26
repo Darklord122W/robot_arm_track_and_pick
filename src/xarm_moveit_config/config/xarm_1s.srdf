@@ -1,0 +1,62 @@
+<?xml version="1.0"?>
+<robot name="xarm_1s">
+
+  <!-- Virtual joint: world to base_link -->
+  <virtual_joint
+      name="world_joint"
+      type="fixed"
+      parent_frame="world"
+      child_link="base_link" />
+
+  <!-- Arm group: 6 joints -->
+  <group name="arm">
+    <joint name="arm1"/>
+    <joint name="arm2"/>
+    <joint name="arm3"/>
+    <joint name="arm4"/>
+    <joint name="arm5"/>
+    <joint name="arm6"/>
+  </group>
+
+  <group_state name="home" group="arm">
+    <joint name="arm1" value="-1.5"/>
+    <joint name="arm2" value="0"/>
+    <joint name="arm3" value="0"/>
+    <joint name="arm4" value="0"/>
+    <joint name="arm5" value="0"/>
+    <joint name="arm6" value="0"/>
+  </group_state>
+
+  
+  <!-- Base -->
+  <disable_collisions link1="base_link" link2="depth"      reason="Adjacent"/>
+  <disable_collisions link1="base_link" link2="link0"      reason="Adjacent"/>
+  <disable_collisions link1="base_link" link2="link0_left" reason="Adjacent"/>
+  <disable_collisions link1="base_link" link2="link6"      reason="Adjacent"/>
+
+  <!-- depth is fixed to link2, disable with everything in the gripper assembly -->
+  <disable_collisions link1="depth" link2="link0"      reason="Adjacent"/>
+  <disable_collisions link1="depth" link2="link0_left" reason="Adjacent"/>
+  <disable_collisions link1="depth" link2="link1"      reason="Never"/>
+  <disable_collisions link1="depth" link2="link1_left" reason="Never"/>
+  <disable_collisions link1="depth" link2="link2"      reason="Adjacent"/>
+  <disable_collisions link1="depth" link2="link3"      reason="Never"/>
+
+  <!-- Gripper parallel linkage: all pairs within {link0, link0_left, link1, link1_left} -->
+  <disable_collisions link1="link0"      link2="link0_left" reason="Adjacent"/>
+  <disable_collisions link1="link0"      link2="link1"      reason="Adjacent"/>
+  <disable_collisions link1="link0"      link2="link1_left" reason="Never"/>
+  <disable_collisions link1="link0"      link2="link2"      reason="Never"/>
+  <disable_collisions link1="link0_left" link2="link1"      reason="Never"/>
+  <disable_collisions link1="link0_left" link2="link1_left" reason="Adjacent"/>
+  <disable_collisions link1="link0_left" link2="link2"      reason="Never"/>
+  <disable_collisions link1="link1"      link2="link1_left" reason="Adjacent"/>
+  <disable_collisions link1="link1"      link2="link2"      reason="Adjacent"/>
+  <disable_collisions link1="link1_left" link2="link2"      reason="Adjacent"/>
+
+  <!-- Arm chain -->
+  <disable_collisions link1="link2" link2="link3" reason="Adjacent"/>
+  <disable_collisions link1="link3" link2="link4" reason="Adjacent"/>
+  <disable_collisions link1="link4" link2="link5" reason="Adjacent"/>
+  <disable_collisions link1="link5" link2="link6" reason="Adjacent"/>
+</robot>
