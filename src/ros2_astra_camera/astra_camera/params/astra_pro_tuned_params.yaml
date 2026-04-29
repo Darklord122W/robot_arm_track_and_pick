@@ -29,9 +29,11 @@ depth_height: 480
 depth_fps: 30
 enable_depth: true
 
-# Keep depth in its own optical frame. Set true only if a downstream consumer
-# needs depth already registered to color — hardware D2C reduces effective FOV.
-depth_align: false
+# Hardware D2C alignment: depth pixels are registered to the colour frame so a
+# single set of intrinsics works for both, and pixel masks computed on depth
+# overlay correctly on colour. Required by the cube_detector node.
+# Trade-off: hardware D2C slightly reduces the effective depth FOV.
+depth_align: true
 
 serial_number: ""
 number_of_devices: 1

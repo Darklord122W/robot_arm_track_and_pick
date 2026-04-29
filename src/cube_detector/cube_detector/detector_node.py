@@ -36,9 +36,9 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import CameraInfo, Image
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseArray, PoseStamped, TransformStamped
 from std_msgs.msg import Header
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import TransformBroadcaster
 
 from .detector import (
@@ -85,6 +85,21 @@ class CubeDetectorNode(Node):
         gp('sync_slop',               0.05)
         gp('processing_period_s',     0.1)
         gp('warn_on_frame_mismatch',  True)
+        # Live-tunable software shift to compensate for residual hardware D2C
+        # error. Positive dx shifts the depth image right; positive dy shifts
+        # it down, before any height-map / mask computation.
+        gp('depth_uv_offset_x', 0)
+        gp('depth_uv_offset_y', 0)
+        # Detection mode: 'depth_fusion' (default) or 'rgb_only'
+        gp('detection_mode', 'depth_fusion')
+        gp('rgb_min_area_px', 80)
+        gp('rgb_max_area_px', 8000)
+        gp('rgb_aspect_tol',  0.30)
+        # Detect-many: when True, publish all valid cubes per frame (PoseArray
+        # + MarkerArray); the single ~/pose still publishes the best by score
+        # for back-compat.  Temporal smoothing only applies in single mode.
+        gp('multi_cube', False)
+        gp('max_cubes', 8)
 
         v = lambda name: self.get_parameter(name).value
         self.cube_frame_id = str(v('cube_frame_id'))
@@ -95,6 +110,17 @@ class CubeDetectorNode(Node):
         self.publish_debug = bool(v('publish_debug_image'))
         self.processing_period = float(v('processing_period_s'))
         self.warn_on_frame_mismatch = bool(v('warn_on_frame_mismatch'))
+        self._uv_dx = int(v('depth_uv_offset_x'))
+        self._uv_dy = int(v('depth_uv_offset_y'))
+        self.multi_cube = bool(v('multi_cube'))
+        self.max_cubes = int(v('max_cubes'))
+
+        self.detection_mode = str(v('detection_mode')).lower()
+        if self.detection_mode not in ('depth_fusion', 'rgb_only'):
+            raise ValueError(
+                f"detection_mode must be 'depth_fusion' or 'rgb_only', "
+                f"got {self.detection_mode!r}"
+            )
 
         self.det = CubeDetector(
             cube_size=float(v('cube_size')),
@@ -104,6 +130,9 @@ class CubeDetectorNode(Node):
             ransac_threshold=float(v('ransac_threshold')),
             ransac_subsample=int(v('ransac_subsample')),
             edge_refine=bool(v('edge_refine')),
+            rgb_min_area_px=int(v('rgb_min_area_px')),
+            rgb_max_area_px=int(v('rgb_max_area_px')),
+            rgb_aspect_tol=float(v('rgb_aspect_tol')),
         )
 
         self.bridge = CvBridge()
@@ -121,20 +150,28 @@ class CubeDetectorNode(Node):
             self._info_cb, sensor_qos,
         )
 
-        color_sub = message_filters.Subscriber(
-            self, Image, str(v('color_topic')), qos_profile=sensor_qos
-        )
-        depth_sub = message_filters.Subscriber(
-            self, Image, str(v('depth_topic')), qos_profile=sensor_qos
-        )
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [color_sub, depth_sub], queue_size=10,
-            slop=float(v('sync_slop')),
-        )
-        self.sync.registerCallback(self._on_synced)
+        if self.detection_mode == 'depth_fusion':
+            color_sub = message_filters.Subscriber(
+                self, Image, str(v('color_topic')), qos_profile=sensor_qos
+            )
+            depth_sub = message_filters.Subscriber(
+                self, Image, str(v('depth_topic')), qos_profile=sensor_qos
+            )
+            self.sync = message_filters.ApproximateTimeSynchronizer(
+                [color_sub, depth_sub], queue_size=10,
+                slop=float(v('sync_slop')),
+            )
+            self.sync.registerCallback(self._on_synced)
+        else:  # rgb_only — depth not used, no synchroniser
+            self.create_subscription(
+                Image, str(v('color_topic')),
+                self._on_color_only, sensor_qos,
+            )
 
         self.pose_pub = self.create_publisher(PoseStamped, '~/pose', 10)
         self.marker_pub = self.create_publisher(Marker, '~/marker', 10)
+        self.poses_pub = self.create_publisher(PoseArray, '~/poses', 10)
+        self.markers_pub = self.create_publisher(MarkerArray, '~/markers', 10)
         self.debug_pub = self.create_publisher(Image, '~/debug_image', 5)
         self.tf_broadcaster = (
             TransformBroadcaster(self) if self.publish_tf else None
@@ -144,11 +181,44 @@ class CubeDetectorNode(Node):
         self._smoothed: Optional[CubeDetection] = None
         self._stale_count = 0
 
+        self.add_on_set_parameters_callback(self._on_param_change)
+
         self.get_logger().info(
-            f"cube_detector started  "
+            f"cube_detector started  mode={self.detection_mode}  "
             f"cube_size={self.det.cube_size*1000:.1f}mm  "
-            f"min_score={self.min_score}  edge_refine={self.det.edge_refine}"
+            f"min_score={self.min_score}  edge_refine={self.det.edge_refine}  "
+            f"depth_uv_offset=({self._uv_dx},{self._uv_dy})"
         )
+        if self.detection_mode == 'rgb_only':
+            self.get_logger().warn(
+                "rgb_only mode: no depth gating — detector will accept any "
+                "convex quad in [rgb_min_area_px..rgb_max_area_px] that passes "
+                "shape scoring. Tune the area band to your working distance."
+            )
+        if self.multi_cube:
+            self.get_logger().info(
+                f"multi_cube ON  max_cubes={self.max_cubes}.  "
+                "Publishing PoseArray on ~/poses and MarkerArray on ~/markers; "
+                "temporal smoothing is disabled in this mode."
+            )
+
+    # ------------------------------------------------------------------
+    def _on_param_change(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name == 'depth_uv_offset_x':
+                self._uv_dx = int(p.value)
+                self.get_logger().info(f"depth_uv_offset_x -> {self._uv_dx}")
+            elif p.name == 'depth_uv_offset_y':
+                self._uv_dy = int(p.value)
+                self.get_logger().info(f"depth_uv_offset_y -> {self._uv_dy}")
+            elif p.name == 'min_score':
+                self.min_score = float(p.value)
+            elif p.name == 'temporal_alpha':
+                self.alpha = float(p.value)
+            elif p.name == 'temporal_max_jump_m':
+                self.max_jump = float(p.value)
+        return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------
     def _info_cb(self, msg: CameraInfo):
@@ -160,19 +230,10 @@ class CubeDetectorNode(Node):
 
     # ------------------------------------------------------------------
     def _on_synced(self, color_msg: Image, depth_msg: Image):
-        # Throttle
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if now - self._last_proc_time < self.processing_period:
+        if self._throttled():
             return
-        self._last_proc_time = now
-
-        with self._K_lock:
-            K = None if self._K is None else self._K.copy()
+        K = self._latest_K()
         if K is None:
-            self.get_logger().warn(
-                "waiting for camera_info...",
-                throttle_duration_sec=5.0,
-            )
             return
 
         if (self.warn_on_frame_mismatch
@@ -214,32 +275,122 @@ class CubeDetectorNode(Node):
                 interpolation=cv2.INTER_NEAREST,
             )
 
-        det, debug = self.det.detect(rgb, depth_m, K)
+        if self._uv_dx != 0 or self._uv_dy != 0:
+            M = np.array(
+                [[1.0, 0.0, float(self._uv_dx)],
+                 [0.0, 1.0, float(self._uv_dy)]],
+                dtype=np.float32,
+            )
+            depth_m = cv2.warpAffine(
+                depth_m, M, (depth_m.shape[1], depth_m.shape[0]),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            )
 
-        accepted = (det is not None) and (det.score >= self.min_score)
-        smoothed = self._update_smoothed(det if accepted else None)
+        if self.multi_cube:
+            dets, debug = self.det.detect_all(rgb, depth_m, K)
+        else:
+            best, debug = self.det.detect(rgb, depth_m, K)
+            dets = [best] if best is not None else []
+        debug['uv_offset'] = (self._uv_dx, self._uv_dy)
+        self._publish_outputs(rgb, dets, debug, color_msg.header)
+
+    # ------------------------------------------------------------------
+    def _on_color_only(self, color_msg: Image):
+        if self._throttled():
+            return
+        K = self._latest_K()
+        if K is None:
+            return
+
+        try:
+            rgb = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='rgb8')
+        except Exception as e:
+            self.get_logger().error(f"cv_bridge conversion failed: {e}")
+            return
+
+        if self.multi_cube:
+            dets, debug = self.det.detect_rgb_only_all(rgb, K)
+        else:
+            best, debug = self.det.detect_rgb_only(rgb, K)
+            dets = [best] if best is not None else []
+        self._publish_outputs(rgb, dets, debug, color_msg.header)
+
+    # ------------------------------------------------------------------
+    def _throttled(self) -> bool:
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._last_proc_time < self.processing_period:
+            return True
+        self._last_proc_time = now
+        return False
+
+    def _latest_K(self) -> Optional[np.ndarray]:
+        with self._K_lock:
+            K = None if self._K is None else self._K.copy()
+        if K is None:
+            self.get_logger().warn(
+                "waiting for camera_info...",
+                throttle_duration_sec=5.0,
+            )
+        return K
+
+    # ------------------------------------------------------------------
+    def _publish_outputs(self, rgb, dets, debug, src_header):
+        # Filter by min_score, then sort best-first and cap at max_cubes.
+        accepted = [d for d in dets if d.score >= self.min_score]
+        accepted.sort(key=lambda d: -d.score)
+        accepted = accepted[: self.max_cubes]
 
         header = Header()
-        header.stamp = color_msg.header.stamp
-        header.frame_id = (color_msg.header.frame_id
+        header.stamp = src_header.stamp
+        header.frame_id = (src_header.frame_id
                            or 'camera_color_optical_frame')
 
-        if smoothed is not None:
-            self._publish_pose(smoothed, header)
-            self._publish_marker(smoothed, header)
-            if self.tf_broadcaster is not None:
-                self._publish_tf(smoothed, header)
-            self.get_logger().info(
-                f"cube xyz=({smoothed.cube_center[0]:.3f},"
-                f"{smoothed.cube_center[1]:.3f},"
-                f"{smoothed.cube_center[2]:.3f})m "
-                f"score={smoothed.score:.2f}",
-                throttle_duration_sec=2.0,
-            )
+        if self.multi_cube:
+            # No temporal smoothing in multi-cube mode (no identity tracking).
+            # Each frame's poses are published as-is.
+            self._publish_poses(accepted, header)
+            self._publish_markers(accepted, header)
+            if accepted:
+                # ~/pose still publishes the best by score for back-compat.
+                self._publish_pose(accepted[0], header)
+                self._publish_marker(accepted[0], header)
+                if self.tf_broadcaster is not None:
+                    self._publish_tf(accepted[0], header)
+                self.get_logger().info(
+                    f"cubes={len(accepted)} best_score={accepted[0].score:.2f} "
+                    f"best_xyz=({accepted[0].cube_center[0]:.3f},"
+                    f"{accepted[0].cube_center[1]:.3f},"
+                    f"{accepted[0].cube_center[2]:.3f})m",
+                    throttle_duration_sec=2.0,
+                )
+        else:
+            best = accepted[0] if accepted else None
+            smoothed = self._update_smoothed(best)
+            if smoothed is not None:
+                self._publish_pose(smoothed, header)
+                self._publish_marker(smoothed, header)
+                if self.tf_broadcaster is not None:
+                    self._publish_tf(smoothed, header)
+                self.get_logger().info(
+                    f"cube xyz=({smoothed.cube_center[0]:.3f},"
+                    f"{smoothed.cube_center[1]:.3f},"
+                    f"{smoothed.cube_center[2]:.3f})m "
+                    f"score={smoothed.score:.2f}",
+                    throttle_duration_sec=2.0,
+                )
 
         if self.publish_debug:
             try:
-                dbg = draw_debug(rgb, det if accepted else None, debug)
+                if self.multi_cube:
+                    dbg = draw_debug(rgb, accepted, debug)
+                else:
+                    smoothed_or_best = (
+                        self._smoothed
+                        if (not self.multi_cube and self._smoothed is not None)
+                        else (accepted[0] if accepted else None)
+                    )
+                    dbg = draw_debug(rgb, smoothed_or_best, debug)
                 msg = self.bridge.cv2_to_imgmsg(dbg, encoding='rgb8')
                 msg.header = header
                 self.debug_pub.publish(msg)
@@ -313,6 +464,69 @@ class CubeDetectorNode(Node):
         msg.pose.orientation.z = qz
         msg.pose.orientation.w = qw
         self.pose_pub.publish(msg)
+
+    def _publish_poses(self, dets, header: Header):
+        msg = PoseArray()
+        msg.header = header
+        for det in dets:
+            x, y, z, qx, qy, qz, qw = self._pose_msg(det)
+            from geometry_msgs.msg import Pose
+            p = Pose()
+            p.position.x = x
+            p.position.y = y
+            p.position.z = z
+            p.orientation.x = qx
+            p.orientation.y = qy
+            p.orientation.z = qz
+            p.orientation.w = qw
+            msg.poses.append(p)
+        self.poses_pub.publish(msg)
+
+    def _publish_markers(self, dets, header: Header):
+        arr = MarkerArray()
+        s = float(self.det.cube_size)
+        # First, a DELETEALL so stale markers from previous frames disappear
+        clear = Marker()
+        clear.header = header
+        clear.ns = 'cube_detector_multi'
+        clear.action = Marker.DELETEALL
+        arr.markers.append(clear)
+
+        for i, det in enumerate(dets):
+            x, y, z, qx, qy, qz, qw = self._pose_msg(det)
+            m = Marker()
+            m.header = header
+            m.ns = 'cube_detector_multi'
+            m.id = i
+            m.type = Marker.CUBE
+            m.action = Marker.ADD
+            m.pose.position.x = x
+            m.pose.position.y = y
+            m.pose.position.z = z
+            m.pose.orientation.x = qx
+            m.pose.orientation.y = qy
+            m.pose.orientation.z = qz
+            m.pose.orientation.w = qw
+            m.scale.x = s
+            m.scale.y = s
+            m.scale.z = s
+            # Colour-code by index, modulo palette
+            palette = [
+                (0.1, 1.0, 0.1),
+                (1.0, 0.7, 0.1),
+                (1.0, 0.3, 0.3),
+                (1.0, 0.1, 1.0),
+                (0.3, 1.0, 1.0),
+            ]
+            r, g, b = palette[i % len(palette)]
+            m.color.r = r
+            m.color.g = g
+            m.color.b = b
+            m.color.a = 0.7
+            m.lifetime.sec = 0
+            m.lifetime.nanosec = int(0.5 * 1e9)
+            arr.markers.append(m)
+        self.markers_pub.publish(arr)
 
     def _publish_marker(self, det: CubeDetection, header: Header):
         x, y, z, qx, qy, qz, qw = self._pose_msg(det)

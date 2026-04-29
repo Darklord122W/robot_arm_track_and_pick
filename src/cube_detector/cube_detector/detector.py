@@ -24,7 +24,7 @@ Frame conventions
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -52,6 +52,10 @@ class CubeDetector:
         min_blob_area_px: int = 40,
         min_top_face_px: int = 30,
         edge_refine: bool = True,
+        # rgb-only fallback knobs (used by detect_rgb_only)
+        rgb_min_area_px: int = 80,
+        rgb_max_area_px: int = 8000,
+        rgb_aspect_tol: float = 0.30,
         rng_seed: Optional[int] = None,
     ):
         self.cube_size = float(cube_size)
@@ -63,20 +67,35 @@ class CubeDetector:
         self.min_blob_area_px = int(min_blob_area_px)
         self.min_top_face_px = int(min_top_face_px)
         self.edge_refine = bool(edge_refine)
+        self.rgb_min_area_px = int(rgb_min_area_px)
+        self.rgb_max_area_px = int(rgb_max_area_px)
+        self.rgb_aspect_tol = float(rgb_aspect_tol)
         self._rng = np.random.default_rng(rng_seed)
 
     # ------------------------------------------------------------------
     def detect(
         self, rgb: np.ndarray, depth_m: np.ndarray, K: np.ndarray
     ) -> Tuple[Optional[CubeDetection], dict]:
+        """Single-best detection (depth_fusion). Wraps detect_all."""
+        dets, debug = self.detect_all(rgb, depth_m, K)
+        if not dets:
+            return None, debug
+        best = max(dets, key=lambda d: d.score)
+        return best, debug
+
+    # ------------------------------------------------------------------
+    def detect_all(
+        self, rgb: np.ndarray, depth_m: np.ndarray, K: np.ndarray
+    ) -> Tuple[List[CubeDetection], dict]:
+        """Return ALL valid cube detections in the frame (depth_fusion mode)."""
         debug: dict = {}
         if depth_m.ndim != 2:
-            return None, debug
+            return [], debug
 
         plane = self._fit_table_plane(depth_m, K)
         if plane is None:
             debug['stage_failed'] = 'plane_fit'
-            return None, debug
+            return [], debug
         n, d = plane
         debug['table_normal'] = n
         debug['table_d'] = d
@@ -96,9 +115,9 @@ class CubeDetector:
         debug['n_candidates'] = len(candidates)
         if not candidates:
             debug['stage_failed'] = 'no_candidates'
-            return None, debug
+            return [], debug
 
-        best: Optional[CubeDetection] = None
+        out: List[CubeDetection] = []
         for cand in candidates:
             quad_2d, score = self._extract_top_face(
                 cand, height_map, rgb, K, n, d
@@ -109,20 +128,193 @@ class CubeDetector:
             if pose is None:
                 continue
             cube_center, top_center, R = pose
-            det = CubeDetection(
+            out.append(CubeDetection(
                 cube_center=cube_center,
                 top_center=top_center,
                 rotation=R,
                 table_normal=n,
                 top_face_corners_2d=quad_2d,
                 score=score,
-            )
-            if best is None or det.score > best.score:
-                best = det
+            ))
 
-        if best is None:
+        if not out:
             debug['stage_failed'] = 'top_face_or_pose'
+        return out, debug
+
+    # ------------------------------------------------------------------
+    # RGB-only fallback (no depth)
+    # ------------------------------------------------------------------
+    def detect_rgb_only(
+        self, rgb: np.ndarray, K: np.ndarray
+    ) -> Tuple[Optional[CubeDetection], dict]:
+        """Single-best RGB-only detection. Wraps detect_rgb_only_all."""
+        dets, debug = self.detect_rgb_only_all(rgb, K)
+        if not dets:
+            return None, debug
+        best = max(dets, key=lambda d: d.score)
         return best, debug
+
+    def detect_rgb_only_all(
+        self, rgb: np.ndarray, K: np.ndarray
+    ) -> Tuple[List[CubeDetection], dict]:
+        """All RGB-only detections in the frame.  No depth used."""
+        debug: dict = {'mode': 'rgb_only'}
+        if rgb is None or rgb.size == 0:
+            debug['stage_failed'] = 'no_rgb'
+            return [], debug
+
+        try:
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        except cv2.error:
+            debug['stage_failed'] = 'no_rgb'
+            return [], debug
+
+        gray_f = cv2.bilateralFilter(gray, 5, 60, 60)
+        med = float(np.median(gray_f))
+        lo = max(20, int(0.66 * med))
+        hi = min(255, int(1.33 * med))
+        edges = cv2.Canny(gray_f, lo, hi)
+        kern = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kern, iterations=2)
+        debug['edges'] = edges
+
+        contours, _ = cv2.findContours(
+            edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+        )
+        debug['n_contours'] = len(contours)
+
+        candidate_quads: List[Tuple[np.ndarray, float]] = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < self.rgb_min_area_px or area > self.rgb_max_area_px:
+                continue
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.04 * peri, True)
+            if len(approx) != 4 or not cv2.isContourConvex(approx):
+                continue
+            quad = approx.reshape(4, 2).astype(np.float32)
+            quad = self._order_quad(quad)
+            sides = np.linalg.norm(
+                np.diff(np.vstack([quad, quad[0:1]]), axis=0), axis=1
+            )
+            mean_s = float(np.mean(sides))
+            if mean_s < 1.0:
+                continue
+            if float(np.std(sides)) / mean_s > self.rgb_aspect_tol:
+                continue
+            score = self._score_quad_2d(quad)
+            if score <= 0.0:
+                continue
+            candidate_quads.append((quad, score))
+
+        debug['n_quads'] = len(candidate_quads)
+        if not candidate_quads:
+            debug['stage_failed'] = 'no_quad'
+            return [], debug
+
+        # De-duplicate near-identical quads (Canny often produces concentric
+        # contours along thick edges).
+        candidate_quads = self._dedupe_quads(candidate_quads)
+        debug['n_quads_dedupe'] = len(candidate_quads)
+
+        s = self.cube_size
+        obj_pts = np.array([
+            [-s / 2, +s / 2, 0.0],
+            [+s / 2, +s / 2, 0.0],
+            [+s / 2, -s / 2, 0.0],
+            [-s / 2, -s / 2, 0.0],
+        ], dtype=np.float64)
+
+        out: List[CubeDetection] = []
+        for quad, score in candidate_quads:
+            if self.edge_refine:
+                quad = self._refine_with_edges(quad, rgb)
+            img_pts = quad.astype(np.float64).reshape(-1, 1, 2)
+
+            try:
+                ret, rvecs, tvecs, errs = cv2.solvePnPGeneric(
+                    obj_pts, img_pts, K, np.zeros(4),
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE,
+                )
+            except cv2.error:
+                continue
+            if not ret or len(rvecs) == 0:
+                continue
+
+            max_err_px = 5.0
+            chosen = None
+            chosen_err = float('inf')
+            for rvec, tvec, err in zip(rvecs, tvecs, errs.flatten()):
+                R, _ = cv2.Rodrigues(rvec)
+                if R[2, 2] >= 0:
+                    continue
+                if err > max_err_px:
+                    continue
+                if err < chosen_err:
+                    chosen_err = float(err)
+                    chosen = (R, tvec.flatten())
+            if chosen is None:
+                continue
+
+            R, top_center = chosen
+            if top_center[2] <= 0:
+                continue
+            cube_z = R[:, 2]
+            cube_center = top_center - 0.5 * s * cube_z
+            out.append(CubeDetection(
+                cube_center=cube_center,
+                top_center=top_center,
+                rotation=R,
+                table_normal=cube_z,
+                top_face_corners_2d=quad,
+                score=score,
+            ))
+
+        if not out:
+            debug['stage_failed'] = 'pnp_all_rejected'
+        return out, debug
+
+    @staticmethod
+    def _dedupe_quads(
+        quads: List[Tuple[np.ndarray, float]],
+        center_thresh_px: float = 6.0,
+    ) -> List[Tuple[np.ndarray, float]]:
+        """Merge quads with near-identical centroids; keep the higher score."""
+        kept: List[Tuple[np.ndarray, float, np.ndarray]] = []  # (quad, score, centroid)
+        for quad, score in quads:
+            c = quad.mean(axis=0)
+            merged = False
+            for i, (kq, ks, kc) in enumerate(kept):
+                if np.linalg.norm(c - kc) < center_thresh_px:
+                    if score > ks:
+                        kept[i] = (quad, score, c)
+                    merged = True
+                    break
+            if not merged:
+                kept.append((quad, score, c))
+        return [(q, s) for q, s, _ in kept]
+
+    @staticmethod
+    def _score_quad_2d(quad: np.ndarray) -> float:
+        """Score a 2D quadrilateral for cube-likeness without 3D back-projection."""
+        sides = np.linalg.norm(
+            np.diff(np.vstack([quad, quad[0:1]]), axis=0), axis=1
+        )
+        mean_s = float(np.mean(sides))
+        if mean_s < 1.0:
+            return 0.0
+        side_match = 1.0 - min(1.0, float(np.std(sides)) / mean_s)
+        devs = []
+        for i in range(4):
+            a = quad[i] - quad[(i - 1) % 4]
+            b = quad[(i + 1) % 4] - quad[i]
+            la, lb = np.linalg.norm(a), np.linalg.norm(b)
+            if la < 1e-3 or lb < 1e-3:
+                return 0.0
+            cos_ = float(np.clip(np.dot(a, b) / (la * lb), -1.0, 1.0))
+            devs.append(abs(np.arccos(cos_) - np.pi / 2.0))
+        ang_match = 1.0 - min(1.0, float(np.mean(devs)) / (np.pi / 4.0))
+        return float(0.5 * side_match + 0.5 * ang_match)
 
     # ------------------------------------------------------------------
     # Plane fit
@@ -411,37 +603,75 @@ def rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
     return np.array([x, y, z, w], dtype=np.float64)
 
 
-def draw_debug(rgb: np.ndarray, det: Optional[CubeDetection], debug: dict) -> np.ndarray:
-    """Annotate an RGB image for visualization on the debug topic."""
+_DETECTION_COLORS = [
+    (0, 255, 0),     # bright green
+    (0, 200, 255),   # orange-yellow
+    (255, 80, 80),   # red-pink
+    (255, 0, 255),   # magenta
+    (255, 255, 0),   # cyan-yellow
+]
+
+
+def draw_debug(
+    rgb: np.ndarray,
+    dets,                       # CubeDetection | List[CubeDetection] | None
+    debug: dict,
+) -> np.ndarray:
+    """Annotate an RGB image for visualization on the debug topic.
+
+    `dets` may be a single CubeDetection (back-compat), a list of them, or None.
+    """
     out = rgb.copy()
     above = debug.get('above_mask')
     if above is not None:
-        # Tint above-table pixels lightly
         tint = np.zeros_like(out)
         tint[..., 1] = above
         out = cv2.addWeighted(out, 1.0, tint, 0.25, 0)
 
-    if det is not None:
+    # Normalise to a list
+    if dets is None:
+        det_list: List[CubeDetection] = []
+    elif isinstance(dets, CubeDetection):
+        det_list = [dets]
+    else:
+        det_list = list(dets)
+
+    for i, det in enumerate(det_list):
+        color = _DETECTION_COLORS[i % len(_DETECTION_COLORS)]
         pts = det.top_face_corners_2d.astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(out, [pts], True, (0, 255, 0), 2)
+        cv2.polylines(out, [pts], True, color, 2)
         for p in det.top_face_corners_2d:
             cv2.circle(out, (int(p[0]), int(p[1])), 3, (0, 0, 255), -1)
         cx = int(det.top_face_corners_2d[:, 0].mean())
         cy = int(det.top_face_corners_2d[:, 1].mean())
-        cv2.drawMarker(out, (cx, cy), (0, 255, 255),
-                       cv2.MARKER_CROSS, 14, 2)
-        text = (
-            f"score={det.score:.2f}  "
-            f"xyz=({det.cube_center[0]*100:.1f},"
-            f"{det.cube_center[1]*100:.1f},"
-            f"{det.cube_center[2]*100:.1f})cm"
-        )
-        cv2.putText(out, text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(out, text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.drawMarker(out, (cx, cy), color, cv2.MARKER_CROSS, 14, 2)
+        cv2.putText(out, f"#{i}", (cx + 8, cy - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+
+    if det_list:
+        for i, det in enumerate(det_list):
+            text = (
+                f"#{i} s={det.score:.2f}  "
+                f"xyz=({det.cube_center[0]*100:+.1f},"
+                f"{det.cube_center[1]*100:+.1f},"
+                f"{det.cube_center[2]*100:+.1f})cm"
+            )
+            y = 22 + 18 * i
+            cv2.putText(out, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(out, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 0, 0), 1, cv2.LINE_AA)
     else:
         stage = debug.get('stage_failed', 'unknown')
         cv2.putText(out, f"no detection ({stage})", (10, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
+
+    uv = debug.get('uv_offset')
+    if uv is not None:
+        msg = f"depth_uv_offset = ({uv[0]:+d}, {uv[1]:+d}) px"
+        y = 22 + 18 * max(1, len(det_list))
+        cv2.putText(out, msg, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(out, msg, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (0, 0, 0), 1, cv2.LINE_AA)
     return out

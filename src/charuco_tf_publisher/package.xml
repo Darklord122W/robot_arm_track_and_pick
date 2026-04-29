@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>charuco_tf_publisher</name>
+  <version>0.1.0</version>
+  <description>Detects a ChArUco board in a color image stream and broadcasts the board pose as a TF, intended as the tracking-marker source for easy_handeye2.</description>
+  <maintainer email="limjy09130@gmail.com">darklord</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python-transforms3d-pip</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -71,7 +71,29 @@ ros2 run astra_camera list_devices_node
 
 ## 3. Visualize
 
-RViz2 with the bundled point cloud config:
+### 3.1 rqt_image_view — the go-to 2D viewer
+
+This is the workflow that's verified working on this machine. It pops up a small GUI with a topic dropdown and a QoS dropdown, so the QoS mismatch is fixed in two clicks instead of needing CLI flags.
+
+```bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+In the window:
+
+1. **Topic dropdown** (top of the window) — pick `/camera/color/image_raw`, `/camera/depth/image_raw`, or `/camera/ir/image_raw`.
+2. **Reliability dropdown** — switch from `Reliable` (default) to **`Best Effort`**. Otherwise the image stays black; the Astra driver publishes Best Effort and a Reliable subscriber refuses its data.
+3. To watch two streams side-by-side: launch `rqt_image_view` twice in two terminals, point one at color and one at depth.
+
+If the topic dropdown is empty, the camera node isn't running or `/camera/...` topics haven't appeared yet — verify with `ros2 topic list | grep /camera` (§4).
+
+Install (one-time):
+
+```bash
+sudo apt install -y ros-humble-rqt-image-view
+```
+
+### 3.2 RViz2 — for point clouds + TF
 
 ```bash
 rviz2 -d ~/xarm_moveit/src/ros2_astra_camera/astra_camera/rviz/pointcloud.rviz
@@ -83,15 +105,29 @@ Multi-camera RViz config:
 rviz2 -d ~/xarm_moveit/src/ros2_astra_camera/astra_camera/rviz/multi_camera.rviz
 ```
 
-Quick 2D viewers (no RViz needed):
+> **Same QoS gotcha as rqt:** in each Image / PointCloud2 display, set *Reliability Policy* → **Best Effort**. With Reliable, RViz silently shows nothing — no error, no warning.
+
+### 3.3 image_view (CLI alternative — needs QoS override)
+
+`rqt_image_view` is preferred. The plain `image_view` binary works too, but its default Reliable QoS produces a `RELIABILITY_QOS_POLICY` warning and no frames unless you explicitly override:
 
 ```bash
-ros2 run rqt_image_view rqt_image_view            # GUI, pick any image topic
-ros2 run image_view image_view --ros-args -r image:=/camera/color/image_raw
-ros2 run image_view image_view --ros-args -r image:=/camera/depth/image_raw
+# Short form (newer image_view builds):
+ros2 run image_view image_view --ros-args \
+  -r image:=/camera/color/image_raw \
+  -p reliability:=best_effort
+
+# Long form (always works):
+ros2 run image_view image_view --ros-args \
+  -r image:=/camera/color/image_raw \
+  -p qos_overrides./camera/color/image_raw.subscription.reliability:=best_effort
 ```
 
-> **QoS tip:** default publisher QoS is `Best Effort`. In RViz2, set the image/PointCloud2 display's *Reliability Policy* to `Best Effort`, or it will silently display nothing.
+Install (one-time, separate package from rqt_image_view):
+
+```bash
+sudo apt install -y ros-humble-image-view
+```
 
 ---
 

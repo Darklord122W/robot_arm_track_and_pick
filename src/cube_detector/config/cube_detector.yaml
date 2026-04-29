@@ -1,5 +1,17 @@
 cube_detector:
   ros__parameters:
+    # ---- detection mode ----
+    # 'depth_fusion'  — RGB + depth (recommended; uses table plane segmentation)
+    # 'rgb_only'      — RGB + Canny + IPPE-SQUARE PnP (no depth needed)
+    detection_mode: rgb_only
+
+    # ---- multi-cube ----
+    # When true: publish ALL detected cubes per frame as PoseArray (~/poses)
+    # and MarkerArray (~/markers). The single ~/pose still publishes the
+    # best-scoring cube. Temporal smoothing is disabled in multi mode.
+    multi_cube: true
+    max_cubes: 5
+
     # ---- topics ----
     color_topic: /camera/color/image_raw
     depth_topic: /camera/depth/image_raw
@@ -19,11 +31,11 @@ cube_detector:
     # ---- table-plane RANSAC ----
     ransac_iters: 200
     ransac_threshold: 0.004   # m — plane inlier band (Astra Pro depth std ≈ 3-5 mm)
-    ransac_subsample: 4000
+    ransac_subsamplergb_only: 4000
 
     # ---- detection ----
     edge_refine: true
-    min_score: 0.45           # 0..1; reject low-quality polygons
+    min_score: 0.85           # 0..1; reject low-quality polygons
 
     # ---- temporal smoothing ----
     temporal_alpha: 0.4       # higher = more responsive, lower = smoother
@@ -32,3 +44,17 @@ cube_detector:
     # ---- runtime ----
     sync_slop: 0.05           # s — color/depth time-sync tolerance
     processing_period_s: 0.1  # s — minimum interval between detections (≤10 Hz here)
+
+    # ---- depth-to-color residual shift (depth_fusion mode only) ----
+    # Live-tunable via:  ros2 param set /cube_detector depth_uv_offset_x <int>
+    # Use this to compensate for the few-pixel residual after hardware D2C.
+    # Tune until the green mask overlay sits ON the cube in /cube_detector/debug_image.
+    depth_uv_offset_x: 0      # +ve shifts depth right (in colour pixels)
+    depth_uv_offset_y: 0      # +ve shifts depth down
+
+    # ---- rgb_only mode tuning ----
+    # Pixel-area band for accepted convex quads. Sized for a 25 mm cube at 30-90 cm
+    # with fx ≈ 525 px. Recompute as: (cube_size * fx / Z)^2 px².
+    rgb_min_area_px: 80
+    rgb_max_area_px: 8000
+    rgb_aspect_tol:  0.30     # max std/mean of side lengths (0.0 = perfect square)

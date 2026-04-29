@@ -37,13 +37,13 @@ Parameters::Parameters(rclcpp::Node *node)
 }
 
 Parameters::~Parameters() noexcept {
-  for (auto const &param : param_functions_) {
-    try {
-      node_->undeclare_parameter(param.first);
-    } catch (const rclcpp::exceptions::InvalidParameterTypeException &e) {
-      RCLCPP_ERROR_STREAM(logger_, e.what());
-    }
-  }
+  // Skip undeclare_parameter on shutdown. In Humble, parameters declared via
+  // node->declare_parameter(name, value, descriptor) with a default-constructed
+  // descriptor are *statically typed*; undeclaring them is forbidden and the
+  // framework logs `parameter 'X' has invalid type: cannot undeclare an
+  // statically typed parameter` before throwing. The Parameters object lives
+  // for the node's lifetime, so the node's parameter store is freed anyway.
+  param_functions_.clear();
 }
 
 rclcpp::ParameterValue Parameters::setParam(

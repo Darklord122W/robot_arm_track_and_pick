@@ -69,10 +69,15 @@ UVCCameraDriver::UVCCameraDriver(rclcpp::Node* node, std::shared_ptr<Parameters>
   config_.frame_id = camera_name_ + "_color_frame";
   config_.optical_frame_id = camera_name_ + "_color_optical_frame";
   setupCameraControlService();
+  // QoS: was rmw_qos_profile_sensor_data / .best_effort() — flipped to RELIABLE
+  // so that moveit_calibration's image_transport subscriber (which is RELIABLE
+  // by default and has no QoS-arg overload in Humble) can connect. Reliable
+  // publishers also satisfy Best-Effort subscribers (e.g. RViz, cube_detector),
+  // so this is backwards-compatible. — 2026-04-28
   image_publisher_ =
-      image_transport::create_publisher(node_, "color/image_raw", rmw_qos_profile_sensor_data);
+      image_transport::create_publisher(node_, "color/image_raw", rmw_qos_profile_default);
   camera_info_publisher_ = node_->create_publisher<sensor_msgs::msg::CameraInfo>(
-      "color/camera_info", rclcpp::QoS{1}.best_effort());
+      "color/camera_info", rclcpp::QoS{1}.reliable());
   openCamera();
 }
 

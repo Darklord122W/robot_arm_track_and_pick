@@ -299,11 +299,15 @@ void OBCameraNode::setupPublishers() {
     if (enable_[stream_index]) {
       std::string name = stream_name_[stream_index];
       std::string topic = name + "/image_raw";
+      // QoS: flipped from sensor_data / best_effort to RELIABLE so
+      // moveit_calibration (RELIABLE subscriber by default) can connect.
+      // Reliable pubs are still compatible with BE subs (RViz, cube_detector).
+      // — 2026-04-28
       image_publishers_[stream_index] =
-          image_transport::create_publisher(node_, topic, rmw_qos_profile_sensor_data);
+          image_transport::create_publisher(node_, topic, rmw_qos_profile_default);
       topic = name + "/camera_info";
       camera_info_publishers_[stream_index] =
-          node_->create_publisher<CameraInfo>(topic, rclcpp::QoS{1}.best_effort());
+          node_->create_publisher<CameraInfo>(topic, rclcpp::QoS{1}.reliable());
     }
   }
   extrinsics_publisher_ = node_->create_publisher<Extrinsics>("extrinsic/depth_to_color",
