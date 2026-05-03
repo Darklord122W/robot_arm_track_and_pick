@@ -18,20 +18,64 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import rclpy
 import yaml
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo
+from sensor_msgs.msg import CameraInfo, JointState
 from tf2_ros import Buffer, TransformListener
 
 from xarm_hw.gripper import ARM1_OPEN_RAD, move_gripper
 
-from .arm_ik import solve_ik
+from .arm_ik import JOINT_ORDER, solve_ik
 from .moveit_client import MoveGroupClient
+
+
+PUBLISHER_NODE_NAME = '/charuco_tf_publisher'
+
+
+def set_publisher_marker_id(
+    node: Node,
+    new_id: int,
+    publisher_node: str = PUBLISHER_NODE_NAME,
+    timeout_s: float = 3.0,
+) -> bool:
+    """Push marker_id to charuco_tf_publisher via its SetParameters service.
+
+    Lets us track a different cube without restarting the publisher. The
+    publisher's `_on_param_change` callback handles the swap and resets
+    its branch-tracker history.
+    """
+    cli = node.create_client(SetParameters, f'{publisher_node}/set_parameters')
+    if not cli.wait_for_service(timeout_sec=timeout_s):
+        node.get_logger().error(
+            f'{publisher_node}/set_parameters not available — is the '
+            f'publisher running with node name {publisher_node}?')
+        return False
+    req = SetParameters.Request()
+    p = Parameter()
+    p.name = 'marker_id'
+    p.value = ParameterValue(
+        type=ParameterType.PARAMETER_INTEGER,
+        integer_value=int(new_id),
+    )
+    req.parameters.append(p)
+    fut = cli.call_async(req)
+    rclpy.spin_until_future_complete(node, fut, timeout_sec=timeout_s)
+    if not fut.done() or fut.result() is None:
+        node.get_logger().error('set_parameters call timed out')
+        return False
+    res = fut.result()
+    if not res.results or not res.results[0].successful:
+        reason = res.results[0].reason if res.results else 'no result'
+        node.get_logger().error(f'set_parameters rejected: {reason}')
+        return False
+    return True
 
 
 DEFAULT_HOMOGRAPHY_PATH = Path.home() / '.ros2/xarm_pick/homography.yaml'
@@ -68,14 +112,28 @@ class PickNode(Node):
         self.marker_frame = marker_frame
         self.camera_frame = camera_frame
         self._K: Optional[np.ndarray] = None
+        self._latest_joints: Dict[str, float] = {}
         self.create_subscription(
             CameraInfo, '/camera/color/camera_info', self._info_cb, 10,
+        )
+        self.create_subscription(
+            JointState, '/joint_states', self._js_cb, 10,
         )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
     def _info_cb(self, msg: CameraInfo) -> None:
         self._K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+
+    def _js_cb(self, msg: JointState) -> None:
+        for n, p in zip(msg.name, msg.position):
+            self._latest_joints[n] = float(p)
+
+    def current_arm_q(self) -> Optional[Dict[str, float]]:
+        """Latest position of the five planning joints, or None if any are missing."""
+        if not all(n in self._latest_joints for n in JOINT_ORDER):
+            return None
+        return {n: self._latest_joints[n] for n in JOINT_ORDER}
 
     def cube_pixel(self) -> Optional[Tuple[float, float]]:
         """Look up marker TF in camera optical frame, project to pixel via K."""
@@ -119,6 +177,147 @@ def wait_for_cube(node: PickNode, timeout_s: float = 30.0) -> Optional[Tuple[flo
     return None
 
 
+def run_pick_cycle(
+    node: 'PickNode',
+    mg: MoveGroupClient,
+    H: np.ndarray,
+    table_z: float,
+    args: argparse.Namespace,
+) -> int:
+    """Run one detect → IK → pick → (optional place) cycle.
+
+    Setup (`rclpy.init`, the node, the MoveGroupClient.wait_for_server,
+    and any marker_id switch) must already be done. Returns an exit
+    code (0 = success). Reads per-pick parameters from `args`:
+      place, marker_frame, camera_frame, cube_timeout, pos_tol,
+      tilt_tol_deg, pick_offset, place_offset, approach_height,
+      lift_height, grip_rad, no_execute, no_place, pause_at_pre_grasp.
+
+    Updates `node.marker_frame` so multiple calls with different
+    --marker-frame values track different cubes within one process.
+    """
+    node.marker_frame = args.marker_frame
+
+    print(f'Waiting up to {args.cube_timeout:.0f}s for marker TF '
+          f'({args.camera_frame} -> {args.marker_frame})...')
+    pixel = wait_for_cube(node, timeout_s=args.cube_timeout)
+    if pixel is None:
+        print(f'ERROR: timed out waiting for TF {args.camera_frame} -> '
+              f'{args.marker_frame}. Is charuco_tf_publisher running and '
+              f'seeing the cube marker?')
+        return 3
+    cube_x_raw, cube_y_raw = pixel_to_world(H, *pixel)
+    cube_x = cube_x_raw + float(args.pick_offset[0])
+    cube_y = cube_y_raw + float(args.pick_offset[1])
+    print(f'Cube pixel ({pixel[0]:.1f}, {pixel[1]:.1f}) -> world '
+          f'({cube_x_raw:+.4f}, {cube_y_raw:+.4f}) m')
+    if list(args.pick_offset) != [0.0, 0.0]:
+        print(f'  pick offset {tuple(args.pick_offset)} -> '
+              f'({cube_x:+.4f}, {cube_y:+.4f}) m')
+
+    grasp_z = table_z
+    approach_z = table_z + args.approach_height
+    lift_z = table_z + args.lift_height
+    place_x = float(args.place[0]) + float(args.place_offset[0])
+    place_y = float(args.place[1]) + float(args.place_offset[1])
+
+    targets = [
+        ('PRE_GRASP', (cube_x, cube_y, approach_z)),
+        ('GRASP',     (cube_x, cube_y, grasp_z)),
+        ('LIFT',      (cube_x, cube_y, lift_z)),
+    ]
+    if not args.no_place:
+        targets += [
+            ('PLACE_APPROACH', (place_x, place_y, lift_z)),
+            ('DROP',      (place_x, place_y, grasp_z)),
+            ('RETRACT',   (place_x, place_y, lift_z)),
+        ]
+
+    end_t = time.monotonic() + 2.0
+    while time.monotonic() < end_t and node.current_arm_q() is None:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    ref_q = node.current_arm_q()
+    if ref_q is None:
+        print('WARN: no /joint_states received in 2.0s — IK will solve '
+              'without a reference pose; arm may flip between branches.')
+    else:
+        qs = ', '.join(f'{n}={ref_q[n]:+.3f}' for n in JOINT_ORDER)
+        print(f'\nUsing live arm pose as IK reference: {qs}')
+
+    solved = []
+    any_unreachable = False
+    print('\nSolving IK for each target:')
+    for name, pos in targets:
+        ik = solve_ik(pos, gripper_down_weight=GRIPPER_DOWN_WEIGHT,
+                      reference_q=ref_q)
+        tilt_deg = float(np.degrees(ik.z_err_rad))
+        ok = ik.pos_err_m <= args.pos_tol and tilt_deg <= args.tilt_tol_deg
+        mark = '  ' if ok else 'XX'
+        print(f'  {mark} {name:15s} ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f})  '
+              f'pos_err={ik.pos_err_m * 1000:5.1f}mm  tilt={tilt_deg:4.1f}deg')
+        if not ok:
+            any_unreachable = True
+        solved.append((name, pos, ik))
+        ref_q = dict(ik.joints)
+
+    if any_unreachable:
+        r_pick = (cube_x ** 2 + cube_y ** 2) ** 0.5
+        r_place = (place_x ** 2 + place_y ** 2) ** 0.5
+        print('\nERROR: some targets are outside the arm\'s gripper-down workspace.')
+        print(f'  Cube radial distance from base: {r_pick * 1000:.0f} mm')
+        print(f'  Place radial distance from base: {r_place * 1000:.0f} mm')
+        print('  Workable range for this 5-DOF arm: ~80 mm to ~200 mm radius.')
+        print('  Move the cube and/or place point inside that ring,')
+        print('  then re-run calibrate_homography if you moved the cube.')
+        print('  (Override with --pos-tol / --tilt-tol-deg if you want to try anyway.)')
+        return 8
+
+    if args.no_execute:
+        print('\n--no-execute: targets above are reachable; not moving.')
+        print(f'  GRIP_RAD = {args.grip_rad:+.3f}')
+        return 0
+
+    print('\n-> open gripper')
+    if not move_gripper(node, ARM1_OPEN_RAD, duration_s=1.0):
+        print('  open failed')
+        return 4
+    time.sleep(0.5)
+
+    for name, pos, ik in solved:
+        print(f'-> {name} ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f})')
+        if not mg.move_to_joints(ik.joints):
+            print(f'  {name} plan/execute failed; aborting')
+            return 5
+        time.sleep(0.3)
+        if name == 'PRE_GRASP' and args.pause_at_pre_grasp > 0:
+            print(f'   ...pausing {args.pause_at_pre_grasp:.1f}s '
+                  f'(read `ros2 run tf2_ros tf2_echo world tool0` now)')
+            time.sleep(args.pause_at_pre_grasp)
+        if name == 'GRASP':
+            print(f'-> close gripper (arm1={args.grip_rad:+.3f})')
+            if not move_gripper(node, args.grip_rad, duration_s=1.0):
+                print('  close failed; aborting')
+                return 6
+            time.sleep(1.0)
+        elif name == 'DROP':
+            print('-> open gripper')
+            if not move_gripper(node, ARM1_OPEN_RAD, duration_s=1.0):
+                print('  open failed')
+                return 7
+            time.sleep(0.5)
+
+    if args.no_place:
+        print('-> HOME (joints all zero, holding cube)')
+        home_joints = {'arm2': 0.0, 'arm3': 0.0, 'arm4': 0.0,
+                       'arm5': 0.0, 'arm6': 0.0}
+        if not mg.move_to_joints(home_joints):
+            print('  HOME plan/execute failed')
+            return 9
+
+    print('Pick complete.')
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description='2D homography-driven cube pick.')
     ap.add_argument('--homography', type=Path, default=DEFAULT_HOMOGRAPHY_PATH,
@@ -143,6 +342,11 @@ def main():
                     help='Seconds to wait for the marker TF')
     ap.add_argument('--marker-frame', default=DEFAULT_MARKER_FRAME,
                     help='child_frame published by charuco_tf_publisher')
+    ap.add_argument('--marker-id', type=int, default=None,
+                    help='Set the publisher\'s marker_id parameter at startup. '
+                         'Switches the tracked cube without restarting the '
+                         'publisher. Requires charuco_tf_publisher running '
+                         'with node name /charuco_tf_publisher.')
     ap.add_argument('--camera-frame', default=DEFAULT_CAMERA_FRAME)
     ap.add_argument('--pos-tol', type=float, default=DEFAULT_POS_TOL_M,
                     help='Max IK position error (m) before refusing to move')
@@ -189,118 +393,15 @@ def main():
             print('ERROR: MoveGroup action server not available — is move_group running?')
             return 2
 
-        print(f'Waiting up to {args.cube_timeout:.0f}s for marker TF '
-              f'({args.camera_frame} -> {args.marker_frame})...')
-        pixel = wait_for_cube(node, timeout_s=args.cube_timeout)
-        if pixel is None:
-            print(f'ERROR: timed out waiting for TF {args.camera_frame} -> '
-                  f'{args.marker_frame}. Is charuco_tf_publisher running and '
-                  f'seeing the cube marker?')
-            return 3
-        cube_x_raw, cube_y_raw = pixel_to_world(H, *pixel)
-        cube_x = cube_x_raw + float(args.pick_offset[0])
-        cube_y = cube_y_raw + float(args.pick_offset[1])
-        print(f'Cube pixel ({pixel[0]:.1f}, {pixel[1]:.1f}) -> world '
-              f'({cube_x_raw:+.4f}, {cube_y_raw:+.4f}) m')
-        if args.pick_offset != [0.0, 0.0]:
-            print(f'  pick offset {tuple(args.pick_offset)} -> '
-                  f'({cube_x:+.4f}, {cube_y:+.4f}) m')
+        if args.marker_id is not None:
+            print(f'Switching publisher to marker_id={args.marker_id}...')
+            if not set_publisher_marker_id(node, args.marker_id):
+                return 11
+            # Brief settle so a fresh detection of the new marker arrives
+            # before wait_for_cube starts polling.
+            time.sleep(0.5)
 
-        # table_z (from calibration) IS the grasp height for tool0; do not
-        # add an offset. PRE_GRASP descends through approach_z; while
-        # holding the cube the arm transits at the higher lift_z so the
-        # cube clears the table.
-        grasp_z = table_z
-        approach_z = table_z + args.approach_height
-        lift_z = table_z + args.lift_height
-        place_x = float(args.place[0]) + float(args.place_offset[0])
-        place_y = float(args.place[1]) + float(args.place_offset[1])
-
-        targets = [
-            ('PRE_GRASP', (cube_x, cube_y, approach_z)),
-            ('GRASP',     (cube_x, cube_y, grasp_z)),
-            ('LIFT',      (cube_x, cube_y, lift_z)),
-        ]
-        if not args.no_place:
-            targets += [
-                ('PLACE_APPROACH', (place_x, place_y, lift_z)),
-                ('DROP',      (place_x, place_y, grasp_z)),
-                ('RETRACT',   (place_x, place_y, lift_z)),
-            ]
-
-        # Solve IK up-front for every target. If any are unreachable we
-        # report the problem now (before moving the arm at all) and abort.
-        solved = []
-        any_unreachable = False
-        print('\nSolving IK for each target:')
-        for name, pos in targets:
-            ik = solve_ik(pos, gripper_down_weight=GRIPPER_DOWN_WEIGHT)
-            tilt_deg = float(np.degrees(ik.z_err_rad))
-            ok = ik.pos_err_m <= args.pos_tol and tilt_deg <= args.tilt_tol_deg
-            mark = '  ' if ok else 'XX'
-            print(f'  {mark} {name:15s} ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f})  '
-                  f'pos_err={ik.pos_err_m * 1000:5.1f}mm  tilt={tilt_deg:4.1f}deg')
-            if not ok:
-                any_unreachable = True
-            solved.append((name, pos, ik))
-
-        if any_unreachable:
-            r_pick = (cube_x ** 2 + cube_y ** 2) ** 0.5
-            r_place = (place_x ** 2 + place_y ** 2) ** 0.5
-            print('\nERROR: some targets are outside the arm\'s gripper-down workspace.')
-            print(f'  Cube radial distance from base: {r_pick * 1000:.0f} mm')
-            print(f'  Place radial distance from base: {r_place * 1000:.0f} mm')
-            print('  Workable range for this 5-DOF arm: ~80 mm to ~200 mm radius.')
-            print('  Move the cube and/or place point inside that ring,')
-            print('  then re-run calibrate_homography if you moved the cube.')
-            print('  (Override with --pos-tol / --tilt-tol-deg if you want to try anyway.)')
-            return 8
-
-        if args.no_execute:
-            print('\n--no-execute: targets above are reachable; not moving.')
-            print(f'  GRIP_RAD = {args.grip_rad:+.3f}')
-            return 0
-
-        # 1. Open
-        print('\n-> open gripper')
-        if not move_gripper(node, ARM1_OPEN_RAD, duration_s=1.0):
-            print('  open failed')
-            return 4
-        time.sleep(0.5)
-
-        for name, pos, ik in solved:
-            print(f'-> {name} ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f})')
-            if not mg.move_to_joints(ik.joints):
-                print(f'  {name} plan/execute failed; aborting')
-                return 5
-            time.sleep(0.3)
-            if name == 'PRE_GRASP' and args.pause_at_pre_grasp > 0:
-                print(f'   ...pausing {args.pause_at_pre_grasp:.1f}s '
-                      f'(read `ros2 run tf2_ros tf2_echo world tool0` now)')
-                time.sleep(args.pause_at_pre_grasp)
-            if name == 'GRASP':
-                print(f'-> close gripper (arm1={args.grip_rad:+.3f})')
-                if not move_gripper(node, args.grip_rad, duration_s=1.0):
-                    print('  close failed; aborting')
-                    return 6
-                time.sleep(1.0)
-            elif name == 'DROP':
-                print('-> open gripper')
-                if not move_gripper(node, ARM1_OPEN_RAD, duration_s=1.0):
-                    print('  open failed')
-                    return 7
-                time.sleep(0.5)
-
-        if args.no_place:
-            print('-> HOME (joints all zero, holding cube)')
-            home_joints = {'arm2': 0.0, 'arm3': 0.0, 'arm4': 0.0,
-                           'arm5': 0.0, 'arm6': 0.0}
-            if not mg.move_to_joints(home_joints):
-                print('  HOME plan/execute failed')
-                return 9
-
-        print('Pick complete.')
-        return 0
+        return run_pick_cycle(node, mg, H, table_z, args)
     finally:
         node.destroy_node()
         rclpy.shutdown()

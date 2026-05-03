@@ -127,6 +127,8 @@ def solve_ik(
     gripper_down_weight: float = 1.0,  # kept for API compat; ignored in current path
     pos_tol_m: float = 0.005,
     n_starts: int = 24,
+    reference_q: Optional[Dict[str, float]] = None,
+    tilt_acceptable_rad: float = np.radians(45.0),
 ) -> IKResult:
     """Solve IK for tool0 at target_xyz.
 
@@ -137,11 +139,32 @@ def solve_ik(
 
     `success` here means position error < pos_tol_m. Orientation is a
     diagnostic, not a pass/fail.
+
+    `reference_q` (optional): joint dict of a "preferred" configuration.
+    Used as (a) one of the multi-start seeds, and (b) a tiebreaker —
+    among candidates that hit position tol AND have tilt under
+    `tilt_acceptable_rad`, the one with smallest joint-space distance
+    from `reference_q` wins. WHY: 5-DOF arms have multiple IK branches
+    (e.g. base-aimed-at-target with elbow forward, vs base-flipped with
+    elbow back ("over the top")). Both can reach the same point with
+    similar tilt; selecting purely on lowest tilt makes the chosen
+    branch hop unpredictably between targets, producing the over-the-
+    head paths that RRTConnect then dutifully plans through. Pinning
+    the branch via `reference_q` keeps the whole pick sequence in one
+    homotopy class.
     """
     del gripper_down_weight  # unused — see docstring
 
     target = np.asarray(target_xyz, dtype=np.float64)
     bounds = [JOINT_LIMITS[name] for name in JOINT_ORDER]
+
+    ref_arr: Optional[np.ndarray] = None
+    if reference_q is not None:
+        ref_arr = np.array(
+            [float(np.clip(reference_q[name], *JOINT_LIMITS[name]))
+             for name in JOINT_ORDER],
+            dtype=np.float64,
+        )
 
     def cost_pos(q: np.ndarray) -> float:
         T = fk_tool0(q)
@@ -160,8 +183,11 @@ def solve_ik(
     best: Optional[IKResult] = None
     rng = np.random.default_rng(seed=42)
 
-    seeds = [_seed_from_target(target)]
-    for _ in range(n_starts - 1):
+    seeds = []
+    if ref_arr is not None:
+        seeds.append(ref_arr.copy())
+    seeds.append(_seed_from_target(target))
+    while len(seeds) < n_starts:
         seeds.append(np.array([rng.uniform(lo, hi) for (lo, hi) in bounds]))
 
     HALF_PI = np.pi / 2.0
@@ -193,17 +219,37 @@ def solve_ik(
             joints=joints, pos_err_m=pos_err, z_err_rad=z_err_rad,
             success=(pos_err < pos_tol_m), message='2-pass L-BFGS-B',
         )
-        # Prefer position-success first; among those, lowest tilt.
-        better = (
-            best is None
-            or (candidate.success and not best.success)
-            or (candidate.success and best.success
-                and candidate.z_err_rad < best.z_err_rad)
-            or (not candidate.success and not best.success
-                and candidate.pos_err_m < best.pos_err_m)
-        )
-        if better:
-            best = candidate
+        cand_jd = (float(np.linalg.norm(qf - ref_arr))
+                   if ref_arr is not None else 0.0)
+        if best is None:
+            best, best_jd = candidate, cand_jd
+        else:
+            # Tiered comparison:
+            #   1. Position-success (pos_err < pos_tol) beats failure.
+            #   2. Among successes:
+            #      - Both within tilt_acceptable → reference closeness wins.
+            #      - One within, other outside → within wins.
+            #      - Both outside → lowest tilt wins (existing behaviour).
+            #   3. Among failures: lowest position error wins.
+            if candidate.success and not best.success:
+                better = True
+            elif not candidate.success and best.success:
+                better = False
+            elif candidate.success and best.success:
+                c_acc = candidate.z_err_rad < tilt_acceptable_rad
+                b_acc = best.z_err_rad < tilt_acceptable_rad
+                if c_acc and b_acc:
+                    better = cand_jd < best_jd
+                elif c_acc and not b_acc:
+                    better = True
+                elif not c_acc and b_acc:
+                    better = False
+                else:
+                    better = candidate.z_err_rad < best.z_err_rad
+            else:
+                better = candidate.pos_err_m < best.pos_err_m
+            if better:
+                best, best_jd = candidate, cand_jd
 
     if best is None:
         return IKResult(

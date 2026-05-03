@@ -22,6 +22,7 @@ setup(
             'pick = xarm_pick.pick_node:main',
             'calibrate_homography = xarm_pick.calibrate_homography:main',
             'pick_2d = xarm_pick.pick_2d:main',
+            'pick_sequence = xarm_pick.pick_sequence:main',
         ],
     },
 )

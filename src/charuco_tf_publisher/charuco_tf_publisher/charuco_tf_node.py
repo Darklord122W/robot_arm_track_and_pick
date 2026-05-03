@@ -30,6 +30,7 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import TransformStamped
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -144,6 +145,11 @@ class CharucoTFNode(Node):
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('debug_topic', '/charuco_tf/debug_image')
         self.declare_parameter('image_qos_reliable', True)
+        # Cap the debug image publish rate. rqt_image_view's Qt main thread
+        # can't render full-res BGR8 at the camera's 30 Hz; the queue backs
+        # up until rqt freezes even though `ros2 topic hz` reports the
+        # publisher is healthy. 10 Hz is plenty for human inspection.
+        self.declare_parameter('debug_max_rate_hz', 10.0)
 
         self.mode = str(self.get_parameter('mode').value).lower()
         if self.mode not in ('charuco', 'single_aruco'):
@@ -273,9 +279,22 @@ class CharucoTFNode(Node):
             self.create_subscription(Image, depth_topic, self._on_depth, qos)
 
         self.debug_pub = None
+        self._debug_min_interval_s = 0.0
+        self._debug_last_pub_t = 0.0
         if self.publish_debug:
+            # Sensor-data QoS (BEST_EFFORT, KEEP_LAST=1) matches what
+            # rqt_image_view subscribes with and lets DDS drop stale frames
+            # under the GUI thread's render budget instead of queuing them.
+            debug_qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
             self.debug_pub = self.create_publisher(
-                Image, str(self.get_parameter('debug_topic').value), 1)
+                Image, str(self.get_parameter('debug_topic').value),
+                debug_qos)
+            rate = float(self.get_parameter('debug_max_rate_hz').value)
+            self._debug_min_interval_s = (1.0 / rate) if rate > 0 else 0.0
 
         if self.mode == 'charuco':
             self.get_logger().info(
@@ -288,6 +307,39 @@ class CharucoTFNode(Node):
                 f'single_aruco mode — id={self.marker_id}, '
                 f'edge={self.marker_length*1000:.1f}mm, '
                 f'dict={dict_name}, parent={self.parent_frame}, child={self.child_frame}')
+
+        # Allow `marker_id` to be changed at runtime via
+        #   ros2 param set /charuco_tf_publisher marker_id <new_id>
+        # Useful for picking different cubes without restarting the node.
+        # The branch / sticky tracker state is reset on every change so the
+        # new marker doesn't inherit the previous marker's history (which
+        # would falsely reject the first few frames as branch flips).
+        self.add_on_set_parameters_callback(self._on_param_change)
+
+    def _on_param_change(self, params):
+        """Live parameter updates. Currently handles `marker_id` only:
+        switches the tracked marker and clears tracker state so the new
+        marker is detected fresh."""
+        for p in params:
+            if p.name == 'marker_id':
+                try:
+                    new_id = int(p.value)
+                except Exception:
+                    return SetParametersResult(
+                        successful=False,
+                        reason='marker_id must be an integer')
+                if new_id != self.marker_id:
+                    self.get_logger().info(
+                        f'marker_id: {self.marker_id} -> {new_id} '
+                        f'(resetting tracker state)')
+                    self.marker_id = new_id
+                    self._last_rvec = None
+                    self._last_tvec = None
+                    if hasattr(self, '_rvec_hist'):
+                        self._rvec_hist.clear()
+                    self._consec_rejects = 0
+                    self._reject_count = 0
+        return SetParametersResult(successful=True)
 
     def _on_info(self, msg: CameraInfo):
         if self.camera_matrix is None:
@@ -890,6 +942,11 @@ class CharucoTFNode(Node):
     def _publish_debug(self, image, header):
         if image is None or self.debug_pub is None:
             return
+        if self._debug_min_interval_s > 0.0:
+            now = self.get_clock().now().nanoseconds * 1e-9
+            if (now - self._debug_last_pub_t) < self._debug_min_interval_s:
+                return
+            self._debug_last_pub_t = now
         try:
             msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
             msg.header = header
