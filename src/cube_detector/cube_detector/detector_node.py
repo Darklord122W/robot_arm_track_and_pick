@@ -39,6 +39,12 @@ from sensor_msgs.msg import CameraInfo, Image
 from geometry_msgs.msg import PoseArray, PoseStamped, TransformStamped
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker, MarkerArray
+from vision_msgs.msg import (
+    BoundingBox3D,
+    Detection3D,
+    Detection3DArray,
+    ObjectHypothesisWithPose,
+)
 from tf2_ros import TransformBroadcaster
 
 from .detector import (
@@ -47,6 +53,7 @@ from .detector import (
     draw_debug,
     rotation_matrix_to_quaternion,
 )
+from .tracker import Track, make_tracker
 
 
 def quat_to_mat(q: np.ndarray) -> np.ndarray:
@@ -95,11 +102,36 @@ class CubeDetectorNode(Node):
         gp('rgb_min_area_px', 80)
         gp('rgb_max_area_px', 8000)
         gp('rgb_aspect_tol',  0.30)
+        # Depth validity range (depth_fusion mode only). Astra Pro depth
+        # streams come back with many 0s for invalid pixels AND scattered
+        # spurious values <30 cm that pass the >0 check but are well
+        # below the sensor's physical minimum (~0.4 m). Clamp anything
+        # outside this band to 0 so all downstream `> 0` filters reject
+        # it. The cube sits at ~0.6-1.0 m from the camera in our rig.
+        gp('depth_min_m', 0.30)
+        gp('depth_max_m', 3.0)
         # Detect-many: when True, publish all valid cubes per frame (PoseArray
         # + MarkerArray); the single ~/pose still publishes the best by score
         # for back-compat.  Temporal smoothing only applies in single mode.
         gp('multi_cube', False)
         gp('max_cubes', 8)
+        # ---- Multi-cube identity tracking (see CLAUDE.md §14) ----
+        # enable_tracking adds ~/tracks (Detection3DArray) + per-track
+        # cube_<id> TFs on top of the existing per-frame outputs. Existing
+        # ~/poses / ~/markers / ~/pose / ~/marker / "cube" TF are unchanged.
+        gp('enable_tracking', False)
+        gp('tracker_algorithm', 'kalman_hungarian')   # or 'greedy_nn'
+        gp('track_min_hits', 3)
+        gp('track_min_hits_window', 5)
+        gp('track_max_misses', 10)
+        # Kalman/Hungarian-only knobs
+        gp('track_meas_std_xy_m', 0.005)
+        gp('track_meas_std_z_m',  0.007)
+        gp('track_proc_accel_std_m_s2', 0.05)
+        gp('track_gate_chi2', 11.34)
+        # Greedy-NN-only knobs
+        gp('track_max_jump_m', 0.05)
+        gp('track_vel_alpha',  0.4)
 
         v = lambda name: self.get_parameter(name).value
         self.cube_frame_id = str(v('cube_frame_id'))
@@ -112,6 +144,8 @@ class CubeDetectorNode(Node):
         self.warn_on_frame_mismatch = bool(v('warn_on_frame_mismatch'))
         self._uv_dx = int(v('depth_uv_offset_x'))
         self._uv_dy = int(v('depth_uv_offset_y'))
+        self.depth_min_m = float(v('depth_min_m'))
+        self.depth_max_m = float(v('depth_max_m'))
         self.multi_cube = bool(v('multi_cube'))
         self.max_cubes = int(v('max_cubes'))
 
@@ -134,6 +168,24 @@ class CubeDetectorNode(Node):
             rgb_max_area_px=int(v('rgb_max_area_px')),
             rgb_aspect_tol=float(v('rgb_aspect_tol')),
         )
+
+        # Tracker (optional — see CLAUDE.md §14).
+        self.enable_tracking = bool(v('enable_tracking'))
+        self.tracker_algorithm = str(v('tracker_algorithm')).lower().strip()
+        self.tracker = None
+        if self.enable_tracking:
+            self.tracker = make_tracker(
+                self.tracker_algorithm,
+                meas_std_xy=float(v('track_meas_std_xy_m')),
+                meas_std_z=float(v('track_meas_std_z_m')),
+                proc_accel_std=float(v('track_proc_accel_std_m_s2')),
+                gate_chi2=float(v('track_gate_chi2')),
+                max_jump_m=float(v('track_max_jump_m')),
+                vel_alpha=float(v('track_vel_alpha')),
+                min_hits=int(v('track_min_hits')),
+                min_hits_window=int(v('track_min_hits_window')),
+                max_misses=int(v('track_max_misses')),
+            )
 
         self.bridge = CvBridge()
         sensor_qos = QoSProfile(
@@ -173,6 +225,10 @@ class CubeDetectorNode(Node):
         self.poses_pub = self.create_publisher(PoseArray, '~/poses', 10)
         self.markers_pub = self.create_publisher(MarkerArray, '~/markers', 10)
         self.debug_pub = self.create_publisher(Image, '~/debug_image', 5)
+        self.tracks_pub = self.create_publisher(Detection3DArray, '~/tracks', 10)
+        self.tracks_markers_pub = self.create_publisher(
+            MarkerArray, '~/tracks_markers', 10
+        )
         self.tf_broadcaster = (
             TransformBroadcaster(self) if self.publish_tf else None
         )
@@ -201,6 +257,15 @@ class CubeDetectorNode(Node):
                 "Publishing PoseArray on ~/poses and MarkerArray on ~/markers; "
                 "temporal smoothing is disabled in this mode."
             )
+        if self.enable_tracking:
+            self.get_logger().info(
+                f"tracking ON  algorithm={self.tracker.algorithm}  "
+                f"min_hits={int(v('track_min_hits'))}/"
+                f"{int(v('track_min_hits_window'))}  "
+                f"max_misses={int(v('track_max_misses'))}.  "
+                "Publishing Detection3DArray on ~/tracks, MarkerArray on "
+                "~/tracks_markers, and per-track cube_<id> TFs."
+            )
 
     # ------------------------------------------------------------------
     def _on_param_change(self, params):
@@ -218,6 +283,12 @@ class CubeDetectorNode(Node):
                 self.alpha = float(p.value)
             elif p.name == 'temporal_max_jump_m':
                 self.max_jump = float(p.value)
+            elif p.name == 'depth_min_m':
+                self.depth_min_m = float(p.value)
+                self.get_logger().info(f"depth_min_m -> {self.depth_min_m:.3f}")
+            elif p.name == 'depth_max_m':
+                self.depth_max_m = float(p.value)
+                self.get_logger().info(f"depth_max_m -> {self.depth_max_m:.3f}")
         return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------
@@ -268,6 +339,18 @@ class CubeDetectorNode(Node):
                 throttle_duration_sec=10.0,
             )
             return
+
+        # NaN/Inf guard (rare from Astra, common after rectification on
+        # other sensors). Treat as invalid → 0 so >0 checks reject them.
+        bad = ~np.isfinite(depth_m)
+        if bad.any():
+            depth_m[bad] = 0.0
+
+        # Range clamp: zero out anything outside the sensor's usable band.
+        # Existing downstream filters (`depth_m > 0` in detector.py:107/323/400
+        # and `height[Z == 0] = 0` at detector.py:385) then reject these.
+        out_of_range = (depth_m < self.depth_min_m) | (depth_m > self.depth_max_m)
+        depth_m[out_of_range] = 0.0
 
         if rgb.shape[:2] != depth_m.shape:
             depth_m = cv2.resize(
@@ -345,6 +428,18 @@ class CubeDetectorNode(Node):
         header.stamp = src_header.stamp
         header.frame_id = (src_header.frame_id
                            or 'camera_color_optical_frame')
+
+        # Tracker update: feed the post-min_score detection list. Existing
+        # ~/poses / ~/markers / ~/pose / ~/marker / "cube" TF below are
+        # untouched — tracking is purely additive (~/tracks, cube_<id>).
+        if self.tracker is not None:
+            stamp_s = (float(src_header.stamp.sec)
+                       + float(src_header.stamp.nanosec) * 1e-9)
+            tracks = self.tracker.update(accepted, stamp_s)
+            self._publish_tracks(tracks, header)
+            self._publish_tracks_markers(tracks, header)
+            if self.tf_broadcaster is not None:
+                self._publish_track_tfs(tracks, header)
 
         if self.multi_cube:
             # No temporal smoothing in multi-cube mode (no identity tracking).
@@ -568,6 +663,138 @@ class CubeDetectorNode(Node):
         t.transform.rotation.z = qz
         t.transform.rotation.w = qw
         self.tf_broadcaster.sendTransform(t)
+
+    # ------------------------------------------------------------------
+    # Tracker output (see CLAUDE.md §14)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _track_pose_tuple(track: Track):
+        q = rotation_matrix_to_quaternion(track.latest_R)
+        return (
+            float(track.position[0]), float(track.position[1]),
+            float(track.position[2]),
+            float(q[0]), float(q[1]), float(q[2]), float(q[3]),
+        )
+
+    def _publish_tracks(self, tracks, header: Header):
+        msg = Detection3DArray()
+        msg.header = header
+        s = float(self.det.cube_size)
+        for tr in tracks:
+            x, y, z, qx, qy, qz, qw = self._track_pose_tuple(tr)
+            d = Detection3D()
+            d.header = header
+            d.id = str(tr.id)
+            hyp = ObjectHypothesisWithPose()
+            hyp.hypothesis.class_id = 'cube'
+            denom = max(1, tr.hits + tr.misses)
+            hyp.hypothesis.score = float(tr.hits) / float(denom)
+            hyp.pose.pose.position.x = x
+            hyp.pose.pose.position.y = y
+            hyp.pose.pose.position.z = z
+            hyp.pose.pose.orientation.x = qx
+            hyp.pose.pose.orientation.y = qy
+            hyp.pose.pose.orientation.z = qz
+            hyp.pose.pose.orientation.w = qw
+            d.results.append(hyp)
+            bbox = BoundingBox3D()
+            bbox.center.position.x = x
+            bbox.center.position.y = y
+            bbox.center.position.z = z
+            bbox.center.orientation.x = qx
+            bbox.center.orientation.y = qy
+            bbox.center.orientation.z = qz
+            bbox.center.orientation.w = qw
+            bbox.size.x = s
+            bbox.size.y = s
+            bbox.size.z = s
+            d.bbox = bbox
+            msg.detections.append(d)
+        self.tracks_pub.publish(msg)
+
+    _TRACK_PALETTE = [
+        (0.10, 1.00, 0.10),
+        (1.00, 0.70, 0.10),
+        (1.00, 0.30, 0.30),
+        (1.00, 0.10, 1.00),
+        (0.30, 1.00, 1.00),
+        (1.00, 1.00, 0.30),
+        (0.50, 0.50, 1.00),
+        (1.00, 0.50, 0.50),
+    ]
+
+    def _publish_tracks_markers(self, tracks, header: Header):
+        arr = MarkerArray()
+        clear = Marker()
+        clear.header = header
+        clear.ns = 'cube_detector_tracks'
+        clear.action = Marker.DELETEALL
+        arr.markers.append(clear)
+
+        s = float(self.det.cube_size)
+        for tr in tracks:
+            x, y, z, qx, qy, qz, qw = self._track_pose_tuple(tr)
+            m = Marker()
+            m.header = header
+            m.ns = 'cube_detector_tracks'
+            m.id = int(tr.id)
+            m.type = Marker.CUBE
+            m.action = Marker.ADD
+            m.pose.position.x = x
+            m.pose.position.y = y
+            m.pose.position.z = z
+            m.pose.orientation.x = qx
+            m.pose.orientation.y = qy
+            m.pose.orientation.z = qz
+            m.pose.orientation.w = qw
+            m.scale.x = s
+            m.scale.y = s
+            m.scale.z = s
+            r, g, b = self._TRACK_PALETTE[tr.id % len(self._TRACK_PALETTE)]
+            m.color.r = r
+            m.color.g = g
+            m.color.b = b
+            # Coasting tracks render dimmer to flag "predict-only" frames.
+            m.color.a = 0.45 if tr.status == 'coasting' else 0.85
+            m.lifetime.sec = 0
+            m.lifetime.nanosec = int(2 * self.processing_period * 1e9)
+            arr.markers.append(m)
+
+            label = Marker()
+            label.header = header
+            label.ns = 'cube_detector_track_labels'
+            label.id = int(tr.id)
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = x
+            label.pose.position.y = y
+            label.pose.position.z = z + s
+            label.scale.z = max(0.015, s * 0.8)
+            label.color.r = 1.0
+            label.color.g = 1.0
+            label.color.b = 1.0
+            label.color.a = 1.0
+            label.text = f"#{tr.id}" + (" (coast)" if tr.status == 'coasting' else "")
+            label.lifetime.sec = 0
+            label.lifetime.nanosec = int(2 * self.processing_period * 1e9)
+            arr.markers.append(label)
+
+        self.tracks_markers_pub.publish(arr)
+
+    def _publish_track_tfs(self, tracks, header: Header):
+        for tr in tracks:
+            x, y, z, qx, qy, qz, qw = self._track_pose_tuple(tr)
+            t = TransformStamped()
+            t.header = header
+            t.child_frame_id = f'{self.cube_frame_id}_{tr.id}'
+            t.transform.translation.x = x
+            t.transform.translation.y = y
+            t.transform.translation.z = z
+            t.transform.rotation.x = qx
+            t.transform.rotation.y = qy
+            t.transform.rotation.z = qz
+            t.transform.rotation.w = qw
+            self.tf_broadcaster.sendTransform(t)
 
 
 def main(args=None):

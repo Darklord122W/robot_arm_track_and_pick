@@ -61,3 +61,30 @@ compile_commands.json
 .env.*
 *.pem
 *.key
+
+# Local state / caches (per-machine, never push)
+.cache/
+.claude/
+
+# Ephemeral TF dumps from `ros2 run tf2_tools view_frames`
+frames_*.gv
+frames_*.pdf
+
+# Abandoned hand-eye calibration era scripts (kept on disk for
+# reference; do NOT track. See CLAUDE.md §2 — the 2D homography
+# pivot replaced all of this.)
+auto_handeye_calibrate.py
+dual_prior_solve.py
+fix_calibration_rotation.py
+inject_manifest_intrinsics.py
+ippe_irls_with_prior.py
+ippe_rebranch_resolve.py
+launch_calibration_stack.sh
+multi_run_calibrate.py
+multi_run_park_pooled.py
+offline_calibrate_from_manifests.py
+pooled_handeye_solve.py
+prior_anchored_solve.py
+refine_via_pickup.py
+save_robust_calibration.py
+verify_handeye_run.py

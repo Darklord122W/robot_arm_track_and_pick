@@ -1,8 +1,6 @@
 from setuptools import setup
-import os
-from glob import glob
 
-package_name = 'xarm_hw'
+package_name = 'xarm_pick'
 
 setup(
     name=package_name,
@@ -12,21 +10,18 @@ setup(
         ('share/ament_index/resource_index/packages',
          ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (
-            os.path.join('share', package_name, 'launch'),
-            glob(os.path.join('launch', '*.launch.py')),
-        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='darklord',
-    maintainer_email='you@example.com',
-    description='xArm hardware driver',
+    maintainer_email='25314403062@qq.com',
+    description='xArm 1S pick state machine.',
     license='MIT',
     entry_points={
         'console_scripts': [
-            'xarm_hw_driver = xarm_hw.driver:main',
-            'gripper = xarm_hw.gripper:main',
+            'pick = xarm_pick.pick_node:main',
+            'calibrate_homography = xarm_pick.calibrate_homography:main',
+            'pick_2d = xarm_pick.pick_2d:main',
         ],
     },
 )

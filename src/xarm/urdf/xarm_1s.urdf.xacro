@@ -248,13 +248,16 @@
     </collision>
   </link>
 
-  <!-- TO-DO: move out to separate file -->
-  <joint name="depth_joint" type="fixed">
+  <!-- Tool Center Point: midpoint of link0 / link0_left origins at arm1=0.
+       In link2 frame: avg of (-0.0038, -0.014, 0.062) and (-0.0038, +0.014, 0.062).
+       Pass link_name="tool0" in MoveIt IK requests to plan to the gripper midpoint
+       instead of link2 / link1. -->
+  <joint name="tool0_joint" type="fixed">
     <parent link="link2"/>
-    <child link="depth"/>
-    <origin rpy="-1.5708 0 -1.5708" xyz="0.044 -0.0115 0.045"/>
+    <child link="tool0"/>
+    <origin rpy="0 0 0" xyz="-0.0038 0.0 0.062"/>
   </joint>
-  <link name="depth" />
+  <link name="tool0"/>
 
  <ros2_control name="xarm_1s" type="system">
     <hardware>

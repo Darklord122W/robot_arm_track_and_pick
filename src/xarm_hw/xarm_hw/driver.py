@@ -29,6 +29,17 @@ class XArmHardwareDriver(Node):
             f"driver.py loaded from: {inspect.getfile(XArmHardwareDriver)}"
         )
 
+        # Tunable peak velocity used by the zero-time-trajectory fallback below.
+        # Override at launch with: --ros-args -p fallback_peak_velocity_rad_s:=0.5
+        self.declare_parameter('fallback_peak_velocity_rad_s', 0.3)
+        self.fallback_peak_v = float(
+            self.get_parameter('fallback_peak_velocity_rad_s').value
+        )
+        self.get_logger().info(
+            f"Fallback peak velocity (used when MoveIt sends zero-time traj): "
+            f"{self.fallback_peak_v:.3f} rad/s"
+        )
+
         # ROS joint names from URDF / SRDF / MoveIt
         self.joint_names = ["arm1", "arm2", "arm3", "arm4", "arm5", "arm6"]
 
@@ -163,9 +174,12 @@ class XArmHardwareDriver(Node):
 
     def command_callback(self, msg: JointTrajectory):
         """
-        Receive a trajectory on /joint_trajectory (manual testing).
-        For now we just use the last point and let the servos interpolate.
-        MoveIt will typically use the ActionServer instead of this path.
+        Receive a trajectory on /joint_trajectory (manual testing + gripper).
+        Accepts a subset of joint_names — joints not listed retain their
+        current value (used by the gripper CLI to command arm1 alone).
+        Uses the final point's time_from_start as the move duration;
+        falls back to 500 ms when the field is zero.
+        MoveIt uses the FollowJointTrajectory action below, not this path.
         """
         if not msg.points:
             return
@@ -182,8 +196,10 @@ class XArmHardwareDriver(Node):
             idx = name_to_index[name]
             target[idx] = pos
 
-        # Simple fixed-duration move for topic commands
-        self.send_joint_positions(target, duration_ms=500)
+        t = final_point.time_from_start
+        duration_s = t.sec + t.nanosec * 1e-9
+        duration_ms = int(duration_s * 1000) if duration_s > 1e-6 else 500
+        self.send_joint_positions(target, duration_ms=duration_ms)
 
     # ======================================================================
     #  FollowJointTrajectory Action callbacks (used by MoveIt)
@@ -211,6 +227,47 @@ class XArmHardwareDriver(Node):
             self.get_logger().warn('Trajectory has no points')
             goal_handle.succeed()
             return FollowJointTrajectory.Result()
+
+        # --- DIAGNOSTIC: dump trajectory shape so we can see what speed MoveIt sent ---
+        last_t = traj.points[-1].time_from_start
+        last_dur_s = last_t.sec + last_t.nanosec * 1e-9
+        first_t = traj.points[0].time_from_start
+        first_dur_s = first_t.sec + first_t.nanosec * 1e-9
+        first_pos = list(traj.points[0].positions)
+        last_pos = list(traj.points[-1].positions)
+        max_delta = max(abs(b - a) for a, b in zip(first_pos, last_pos)) if first_pos and last_pos else 0.0
+        avg_v = (max_delta / last_dur_s) if last_dur_s > 1e-6 else 0.0
+        self.get_logger().info(
+            f"TRAJ_DIAG: points={len(traj.points)} "
+            f"first_t={first_dur_s:.3f}s last_t={last_dur_s:.3f}s "
+            f"largest_joint_delta={max_delta:.4f}rad avg_peak_v~{avg_v:.4f}rad/s"
+        )
+        # --- END DIAGNOSTIC ---
+
+        # Fallback: if MoveIt didn't time-parameterize the trajectory (last_t == 0),
+        # synthesise per-segment timing here at a fixed target peak velocity. Without
+        # this the loop below sees segment_dt=0 on every point and races the servo
+        # at full speed regardless of any RViz/YAML scaling.
+        TARGET_PEAK_V = self.fallback_peak_v
+        MIN_SEG_S = 0.05      # never go below 50 ms per segment
+        if last_dur_s < 1e-6 and len(traj.points) > 1:
+            cumulative = 0.0
+            traj.points[0].time_from_start.sec = 0
+            traj.points[0].time_from_start.nanosec = 0
+            for j in range(1, len(traj.points)):
+                prev = list(traj.points[j - 1].positions)
+                curr = list(traj.points[j].positions)
+                seg_max_delta = max(abs(b - a) for a, b in zip(prev, curr)) if prev and curr else 0.0
+                seg_dt = max(seg_max_delta / TARGET_PEAK_V, MIN_SEG_S)
+                cumulative += seg_dt
+                traj.points[j].time_from_start.sec = int(cumulative)
+                traj.points[j].time_from_start.nanosec = int(
+                    (cumulative - int(cumulative)) * 1e9
+                )
+            self.get_logger().warn(
+                f"Trajectory had zero time_from_start (TOTG didn't run). "
+                f"Recomputed timing: total={cumulative:.2f}s at peak_v={TARGET_PEAK_V:.3f}rad/s."
+            )
 
         # Map from our joint_names to indices in traj.joint_names
         index_in_msg = {}

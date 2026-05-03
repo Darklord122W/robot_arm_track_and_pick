@@ -3,14 +3,14 @@ cube_detector:
     # ---- detection mode ----
     # 'depth_fusion'  — RGB + depth (recommended; uses table plane segmentation)
     # 'rgb_only'      — RGB + Canny + IPPE-SQUARE PnP (no depth needed)
-    detection_mode: rgb_only
+    detection_mode: depth_fusion
 
     # ---- multi-cube ----
     # When true: publish ALL detected cubes per frame as PoseArray (~/poses)
     # and MarkerArray (~/markers). The single ~/pose still publishes the
     # best-scoring cube. Temporal smoothing is disabled in multi mode.
     multi_cube: true
-    max_cubes: 5
+    max_cubes: 3
 
     # ---- topics ----
     color_topic: /camera/color/image_raw
@@ -24,7 +24,10 @@ cube_detector:
     warn_on_frame_mismatch: true
 
     # ---- physical model ----
-    cube_size: 0.025          # 25 mm cube
+    cube_size: 0.040          # 40 mm cube (with 30 mm ArUco marker on top — marker
+                              # is unused by this detector; it uses depth + plane
+                              # fit + edge polygon. Marker would only matter to
+                              # charuco_tf_publisher, which is a different node.)
     height_min: 0.005         # ignore anything within 5 mm of the table plane
     height_max_tol: 0.010     # +10 mm slack above the cube height (handles tilt/noise)
 
@@ -52,9 +55,48 @@ cube_detector:
     depth_uv_offset_x: 0      # +ve shifts depth right (in colour pixels)
     depth_uv_offset_y: 0      # +ve shifts depth down
 
+    # ---- depth validity range (depth_fusion mode only) ----
+    # Astra Pro publishes 0 for invalid pixels but ALSO scattered spurious
+    # values <30cm that pass the >0 check yet are well below the sensor's
+    # ~0.4m physical minimum. Anything outside [depth_min_m, depth_max_m]
+    # is zeroed before plane fit and height-map computation, so all
+    # existing `> 0` filters drop it. Cube sits at ~0.6-1.0m in our rig.
+    # Live-tunable via:  ros2 param set /cube_detector depth_min_m 0.3
+    depth_min_m: 0.30
+    depth_max_m: 3.0
+
     # ---- rgb_only mode tuning ----
     # Pixel-area band for accepted convex quads. Sized for a 25 mm cube at 30-90 cm
     # with fx ≈ 525 px. Recompute as: (cube_size * fx / Z)^2 px².
     rgb_min_area_px: 80
     rgb_max_area_px: 8000
     rgb_aspect_tol:  0.30     # max std/mean of side lengths (0.0 = perfect square)
+
+    # ---- multi-cube identity tracking (CLAUDE.md §14) ----
+    # When true, also publishes:
+    #   ~/tracks         vision_msgs/Detection3DArray   (one entry per confirmed track, id = stable string)
+    #   ~/tracks_markers visualization_msgs/MarkerArray (cube + #id label per track)
+    #   /tf              cube_<id>                      (per-track frame, parented to source header frame)
+    # Purely additive — ~/poses, ~/markers, ~/pose, ~/marker, "cube" TF unchanged.
+    enable_tracking: true
+    # 'kalman_hungarian' (recommended): per-cube CV Kalman + Mahalanobis gate +
+    #   Hungarian assignment. Robust to brief occlusion (gripper passing in front
+    #   of a cube) and to two cubes passing within measurement-noise radius.
+    # 'greedy_nn': plain Euclidean nearest-neighbour. Cheap, but swaps IDs when
+    #   cubes pass close, and loses identity when occluded for any frame.
+    tracker_algorithm: kalman_hungarian
+
+    # Lifecycle (shared by both algorithms)
+    track_min_hits:        3   # promote tentative→confirmed after this many hits
+    track_min_hits_window: 5   # within this many frames; else delete tentative
+    track_max_misses:     10   # delete confirmed track after this many consecutive misses
+
+    # Kalman/Hungarian-only knobs
+    track_meas_std_xy_m:        0.005   # measurement std, xy at 1 m (Astra Pro)
+    track_meas_std_z_m:         0.007   # measurement std, z  at 1 m
+    track_proc_accel_std_m_s2:  0.05    # process noise: accel std (m/s²)
+    track_gate_chi2:           11.34    # χ² 99% gate, 3 DOF (use 14.16 for 99.7%)
+
+    # Greedy-NN-only knobs
+    track_max_jump_m: 0.05    # reject NN matches beyond this Euclidean distance
+    track_vel_alpha:  0.4     # EMA on (Δpos / Δt) for velocity output (cosmetic)
