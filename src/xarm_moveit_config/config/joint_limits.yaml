@@ -2,7 +2,17 @@
 
 # For beginners, we downscale velocity and acceleration limits.
 # You can always specify higher scaling factors (<= 1.0) in your motion requests.  # Increase the values below to 1.0 to always move at maximum speed.
-default_velocity_scaling_factor: 0.30
+#
+# Tuning notes (2026-05-03):
+#   - 0.30 / 0.30 + max_accel 0.5 produced visibly stuttered motion.
+#     Root cause was driver-side: setPosition duration was clamped to
+#     200 ms regardless of TOTG segment cadence, so each servo command
+#     was interrupted mid-ramp. Fixed in xarm_hw/driver.py.
+#   - With the driver fix, we can run faster AND smoother: 0.45 / 0.30
+#     speeds the motion to a useful pick speed while max_accel 0.3
+#     keeps TOTG ramps gentle. Continuous-redirect (driver applies a
+#     2.5× duration buffer) hides what residual jitter remains.
+default_velocity_scaling_factor: 0.45
 default_acceleration_scaling_factor: 0.30
 
 # Specific joint properties can be changed with the keys [max_position, min_position, max_velocity, max_acceleration]
@@ -11,42 +21,42 @@ joint_limits:
   arm0:
     has_velocity_limits: false
     has_acceleration_limits: true
-    max_acceleration: 0.5
+    max_acceleration: 0.3
   arm0_left:
     has_velocity_limits: false
     has_acceleration_limits: true
-    max_acceleration: 0.5
+    max_acceleration: 0.3
   arm1:
     has_velocity_limits: true
     max_velocity: 0.3
     has_acceleration_limits: true
-    max_acceleration: 0.5
+    max_acceleration: 0.3
   arm1_left:
     has_velocity_limits: false
     has_acceleration_limits: true
-    max_acceleration: 0.5
+    max_acceleration: 0.3
   arm2:
     has_velocity_limits: true
     max_velocity: 0.3
     has_acceleration_limits: true
-    max_acceleration: 0.5
+    max_acceleration: 0.3
   arm3:
     has_velocity_limits: true
     max_velocity: 0.3
     has_acceleration_limits: true
-    max_acceleration: 0.5
+    max_acceleration: 0.3
   arm4:
     has_velocity_limits: true
     max_velocity: 0.3
     has_acceleration_limits: true
-    max_acceleration: 0.5
+    max_acceleration: 0.3
   arm5:
     has_velocity_limits: true
     max_velocity: 0.3
     has_acceleration_limits: true
-    max_acceleration: 0.5
+    max_acceleration: 0.3
   arm6:
     has_velocity_limits: true
     max_velocity: 0.3
     has_acceleration_limits: true
-    max_acceleration: 0.5
+    max_acceleration: 0.3

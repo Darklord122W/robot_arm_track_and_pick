@@ -299,9 +299,17 @@ class XArmHardwareDriver(Node):
                     # If missing, keep previous value
                     pass
 
-            # Compute move duration for this segment
-            segment_dt = max(t - prev_t, 0.2)  # at least 200 ms per segment
-            duration_ms = int(segment_dt * 1000)
+            # Compute move duration for this segment.
+            # Cadence: how often we send a new setPosition (= TOTG output dt).
+            # Duration: how long the servo is told the move should take.
+            #
+            # duration ≈ 1.5× cadence: the servo finishes 2/3 of each ramp
+            # before the next command lands, eliminating the brief arrival
+            # dwell that produces visible stutter at duration == cadence.
+            # 2.5× was too aggressive — combined with overly-tight jerk
+            # limits it caused trajectories to under-execute.
+            segment_dt = max(t - prev_t, 0.02)
+            duration_ms = max(int(segment_dt * 1500), 30)
 
             self.get_logger().debug(
                 f"Point {i}: t={t:.3f}s, segment_dt={segment_dt:.3f}s, duration_ms={duration_ms}"

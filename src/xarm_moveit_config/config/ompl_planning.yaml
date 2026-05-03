@@ -6,6 +6,11 @@ ompl:
   # in MoveIt 2 Humble. The old name fails to load (pluginlib InvalidClass) and
   # leaves planned paths with no time profile, which makes post-processing
   # return FAILURE (99999) on every request.
+  #
+  # NOTE 2: AddRuckigTrajectorySmoothing was tried here and silently produces
+  # a degenerate trajectory (zero motion) on this 5-DOF arm — MoveIt still
+  # returns SUCCESS so pick_2d "completes" without the arm ever moving.
+  # Do NOT add it back without verifying the executed trajectory length.
   request_adapters: >-
     default_planner_request_adapters/AddTimeOptimalParameterization
     default_planner_request_adapters/FixWorkspaceBounds
@@ -13,6 +18,12 @@ ompl:
     default_planner_request_adapters/FixStartStateCollision
     default_planner_request_adapters/FixStartStatePathConstraints
   start_state_max_bounds_error: 0.1
+
+  # TOTG resample resolution. 0.02 s (50 Hz) is the sweet spot — denser than
+  # this (0.01) starts producing micro-segments that the driver sleeps
+  # through in <1 ms each, and the LewanSoul HID bus can saturate.
+  resample_dt: 0.02
+  path_tolerance: 0.05
 
   # OMPL planner configurations
   planner_configs:
@@ -22,5 +33,8 @@ ompl:
 
 # Assign planner config to your group
 arm:
+  # Tighter validity discretization → finer waypoints from OMPL before
+  # TOTG sees the path. Default 0.005 (0.5 % of joint range).
+  longest_valid_segment_fraction: 0.002
   planner_configs:
     - RRTConnectkConfigDefault

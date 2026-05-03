@@ -45,7 +45,8 @@ DEFAULT_GRIP_RAD = -0.6
 # the cube), so the captured median IS the desired tool0 z for the grasp
 # step. We do NOT add an offset: `grasp_z = table_z` directly. Approach
 # height is then a clearance ABOVE that grasp z.
-DEFAULT_APPROACH_HEIGHT_M = 0.03   # clearance above grasp height for pre-grasp / lift
+DEFAULT_APPROACH_HEIGHT_M = 0.03   # clearance above grasp z for PRE_GRASP descent
+DEFAULT_LIFT_HEIGHT_M = 0.07       # transit altitude for LIFT / PLACE_APPROACH / RETRACT
 DEFAULT_PLACE_XY = (0.10, -0.05)   # placeable point inside the inner ring
 MAX_POSE_AGE_S = 1.5
 
@@ -127,7 +128,11 @@ def main():
                          '(i.e., gripper midpoint at cube center). Defaults to '
                          'suggested_table_z from the calibration YAML.')
     ap.add_argument('--approach-height', type=float, default=DEFAULT_APPROACH_HEIGHT_M,
-                    help='Clearance above grasp z for pre-grasp / lift / place_approach (m)')
+                    help='Clearance above grasp z for the PRE_GRASP descent (m)')
+    ap.add_argument('--lift-height', type=float, default=DEFAULT_LIFT_HEIGHT_M,
+                    help='Transit altitude above grasp z for LIFT / PLACE_APPROACH / '
+                         'RETRACT (m). Keep this above approach-height so the cube '
+                         'clears the table while moving between pick and place.')
     ap.add_argument('--place', nargs=2, type=float, default=list(DEFAULT_PLACE_XY),
                     metavar=('X', 'Y'), help='World XY where the cube is dropped')
     ap.add_argument('--grip-rad', type=float, default=DEFAULT_GRIP_RAD,
@@ -202,22 +207,25 @@ def main():
                   f'({cube_x:+.4f}, {cube_y:+.4f}) m')
 
         # table_z (from calibration) IS the grasp height for tool0; do not
-        # add an offset. Approach is `clearance` above that.
+        # add an offset. PRE_GRASP descends through approach_z; while
+        # holding the cube the arm transits at the higher lift_z so the
+        # cube clears the table.
         grasp_z = table_z
         approach_z = table_z + args.approach_height
+        lift_z = table_z + args.lift_height
         place_x = float(args.place[0]) + float(args.place_offset[0])
         place_y = float(args.place[1]) + float(args.place_offset[1])
 
         targets = [
             ('PRE_GRASP', (cube_x, cube_y, approach_z)),
             ('GRASP',     (cube_x, cube_y, grasp_z)),
-            ('LIFT',      (cube_x, cube_y, approach_z)),
+            ('LIFT',      (cube_x, cube_y, lift_z)),
         ]
         if not args.no_place:
             targets += [
-                ('PLACE_APPROACH', (place_x, place_y, approach_z)),
+                ('PLACE_APPROACH', (place_x, place_y, lift_z)),
                 ('DROP',      (place_x, place_y, grasp_z)),
-                ('RETRACT',   (place_x, place_y, approach_z)),
+                ('RETRACT',   (place_x, place_y, lift_z)),
             ]
 
         # Solve IK up-front for every target. If any are unreachable we
