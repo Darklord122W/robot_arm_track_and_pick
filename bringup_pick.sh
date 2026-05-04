@@ -6,29 +6,27 @@
 #                ↳ robot_state_publisher + RViz
 #                  (URDF + TF chain world → ... → tool0)
 #   driver   T2  ros2 run    xarm_hw xarm_hw_driver
-#                ↳ USB driver, publishes /joint_states
+#                ↳ USB driver + FollowJointTrajectory action server,
+#                  publishes /joint_states.
+#                  Pairs with xarm_pick.local_traj_client (Craig/MR
+#                  trajectory generator); MoveIt is no longer used.
 #   camera   T3  ros2 launch astra_camera astra_pro_tuned.launch.py
 #                ↳ Astra Pro RGB-D, /camera/color/* and /camera/depth/*
 #   marker   T4  ros2 launch charuco_tf_publisher charuco_tf.launch.py
 #                ↳ ArUco tracker; TF camera_color_optical_frame → handeye_target
 #                  Override: --marker-id N --marker-length L --dictionary D
-#   moveit   T5  ros2 launch xarm_moveit_config xarm_1s_moveit.launch.py
-#                ↳ MoveIt move_group action server
 #
 # Profiles (preset combinations):
-#   pick      (default)  display + driver + camera + marker + moveit
+#   pick      (default)  display + driver + camera + marker
 #   calib                display + driver + camera + marker
 #   vision               camera  + marker
 #   robot                display + driver
-#   moveit               display + driver + moveit
 #
 # Usage:
 #   ./bringup_pick.sh                              # pick profile (full stack)
 #   ./bringup_pick.sh --profile calib              # calibration session
 #   ./bringup_pick.sh --profile vision             # camera + marker only
 #   ./bringup_pick.sh --profile robot              # display + driver only
-#   ./bringup_pick.sh --profile moveit             # robot + MoveIt, no camera
-#   ./bringup_pick.sh --no-moveit                  # legacy alias for calib
 #   ./bringup_pick.sh --marker-id 5 --marker-length 0.030 \\
 #                     --dictionary DICT_5X5_50     # custom marker
 #   ./bringup_pick.sh --attach                     # bring up + attach
@@ -51,7 +49,6 @@ WITH_DISPLAY=1
 WITH_DRIVER=1
 WITH_CAMERA=1
 WITH_MARKER=1
-WITH_MOVEIT=1
 
 # Marker config (only used when WITH_MARKER=1).
 T4_MODE="single_aruco"
@@ -61,12 +58,11 @@ T4_DICTIONARY="DICT_5X5_50"
 
 apply_profile() {
     case "$1" in
-        pick)   WITH_DISPLAY=1; WITH_DRIVER=1; WITH_CAMERA=1; WITH_MARKER=1; WITH_MOVEIT=1 ;;
-        calib)  WITH_DISPLAY=1; WITH_DRIVER=1; WITH_CAMERA=1; WITH_MARKER=1; WITH_MOVEIT=0 ;;
-        vision) WITH_DISPLAY=0; WITH_DRIVER=0; WITH_CAMERA=1; WITH_MARKER=1; WITH_MOVEIT=0 ;;
-        robot)  WITH_DISPLAY=1; WITH_DRIVER=1; WITH_CAMERA=0; WITH_MARKER=0; WITH_MOVEIT=0 ;;
-        moveit) WITH_DISPLAY=1; WITH_DRIVER=1; WITH_CAMERA=0; WITH_MARKER=0; WITH_MOVEIT=1 ;;
-        *) echo "unknown profile: $1 (valid: pick|calib|vision|robot|moveit)" >&2; exit 2 ;;
+        pick)   WITH_DISPLAY=1; WITH_DRIVER=1; WITH_CAMERA=1; WITH_MARKER=1 ;;
+        calib)  WITH_DISPLAY=1; WITH_DRIVER=1; WITH_CAMERA=1; WITH_MARKER=1 ;;
+        vision) WITH_DISPLAY=0; WITH_DRIVER=0; WITH_CAMERA=1; WITH_MARKER=1 ;;
+        robot)  WITH_DISPLAY=1; WITH_DRIVER=1; WITH_CAMERA=0; WITH_MARKER=0 ;;
+        *) echo "unknown profile: $1 (valid: pick|calib|vision|robot)" >&2; exit 2 ;;
     esac
 }
 
@@ -76,9 +72,7 @@ while [[ $# -gt 0 ]]; do
         --kill)            ACTION="kill"; shift ;;
         --status)          ACTION="status"; shift ;;
         --attach)          ATTACH_AFTER=1; shift ;;
-        # Legacy + fine-grained component toggles (override profile).
-        --no-moveit)       WITH_MOVEIT=0; shift ;;
-        --moveit)          WITH_MOVEIT=1; shift ;;
+        # Fine-grained component toggles (override profile).
         --no-display)      WITH_DISPLAY=0; shift ;;
         --no-driver)       WITH_DRIVER=0; shift ;;
         --no-camera)       WITH_CAMERA=0; shift ;;
@@ -152,10 +146,6 @@ if [[ $WITH_MARKER -eq 1 ]]; then
         "ros2 launch charuco_tf_publisher charuco_tf.launch.py $T4_ARGS"
 fi
 
-[[ $WITH_MOVEIT -eq 1 ]] && add_pane \
-    "T5 MoveIt + RViz" 6 \
-    "ros2 launch xarm_moveit_config xarm_1s_moveit.launch.py"
-
 if [[ ${#LABELS[@]} -eq 0 ]]; then
     echo "no components enabled — nothing to do" >&2
     exit 2
@@ -202,7 +192,7 @@ EOF
 [[ $WITH_CAMERA -eq 1 ]] && echo "  ros2 topic hz /camera/color/image_raw                                  # ~30 Hz"
 [[ $WITH_MARKER -eq 1 ]] && echo "  ros2 run tf2_ros tf2_echo camera_color_optical_frame handeye_target    # marker pose"
 [[ $WITH_DRIVER -eq 1 && $WITH_DISPLAY -eq 1 ]] && echo "  ros2 run tf2_ros tf2_echo world tool0                                  # arm pose"
-[[ $WITH_MOVEIT -eq 1 ]] && echo "  ros2 action list | grep follow_joint_trajectory                       # MoveIt action up"
+[[ $WITH_DRIVER -eq 1 ]] && echo "  ros2 action list | grep follow_joint_trajectory                       # controller action up"
 
 cat <<EOF
 

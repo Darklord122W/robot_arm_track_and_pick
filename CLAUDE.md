@@ -51,17 +51,27 @@ The two breakthroughs that made it work:
 
 ## 4. Software stack
 
-- ROS 2 Humble, MoveIt 2 (OMPL/RRTConnect for joint-space planning;
-  KDL is bypassed because it returns NO_IK_SOLUTION on the 5-DOF arm).
-- `xarm_hw` driver bridges `/joint_trajectory` → USB hardware via
-  `topic_based_ros2_control`. **Silently clamps all joints to ±π/2**
-  in `rad_to_units` — keep `arm_ik.JOINT_LIMITS` matched to this.
+- ROS 2 Humble. **MoveIt has been removed** — the pick stack now drives
+  the controller directly with a from-scratch trajectory generator
+  (Craig §7 / MR §9.4). KDL never worked on this 5-DOF arm
+  (NO_IK_SOLUTION on every reachable target), and once IK was solved
+  upfront in `arm_ik.py` the rest of MoveIt was a wrapper around TOTG.
+- `xarm_hw` driver runs the USB connection plus a
+  `FollowJointTrajectory` action server on
+  `xarm_1s_arm_controller/follow_joint_trajectory`. **Silently clamps
+  all joints to ±π/2** in `rad_to_units` — keep `arm_ik.JOINT_LIMITS`
+  matched to this.
 - `charuco_tf_publisher` (`single_aruco` mode) broadcasts
   `camera_color_optical_frame → handeye_target` for the cube's
   marker. (Frame name kept for backward compatibility.)
 - `xarm_pick`:
-  - `arm_ik.py` — custom 5-DOF numerical IK (scipy L-BFGS-B,
-    24 random restarts, position-first cost, tilt < 90° filter).
+  - `arm_ik.py` — custom 5-DOF numerical IK (Modern-Robotics-style
+    PoE FK + damped-least-squares Newton with task-priority null-space
+    redundancy resolution; 24 random restarts; tilt < 90° filter).
+  - `trajectory.py` — Craig §7 / MR §9.4 profile generator: cubic,
+    quintic, LSPB, time-optimal trapezoid (selectable via `--method`).
+  - `local_traj_client.py` — `FollowJointTrajectory` action client
+    that consumes the profiles above.
   - `calibrate_homography.py` — interactive 2-phase calibration.
   - `pick_2d.py` — main pick state machine.
   - `gripper.py` (in `xarm_hw`) — drives only `arm1`.
@@ -71,19 +81,18 @@ Workspace: `/home/darklord/xarm_moveit`. Branch: `main`.
 
 ## 5. Bring-up scripts (by use case)
 
-Five tmux components: `display` (T1, RViz + robot_state_publisher),
-`driver` (T2, USB), `camera` (T3, Astra), `marker` (T4, ArUco
-tracker), `moveit` (T5). One script per use case:
+Four tmux components: `display` (T1, RViz + robot_state_publisher),
+`driver` (T2, USB + FollowJointTrajectory action server),
+`camera` (T3, Astra), `marker` (T4, ArUco tracker). One script per use case:
 
 | Script | Components | When to use |
 |---|---|---|
-| `./bringup_pick.sh` | display + driver + camera + marker + moveit | Full pick — `pick_2d`, `pick`. **Default.** |
-| `./bringup_calib.sh` | display + driver + camera + marker | Run `calibrate_homography`. No MoveIt needed. |
+| `./bringup_pick.sh` | display + driver + camera + marker | Full pick — `pick_2d`, `pick`. **Default.** |
+| `./bringup_calib.sh` | display + driver + camera + marker | Run `calibrate_homography`. |
 | `./bringup_vision.sh` | camera + marker | Tune the camera or verify ArUco without powering the arm. |
-| `./bringup_robot.sh` | display + driver | Drag-teach, gripper tuning, raw `/joint_trajectory` testing. No camera, no MoveIt. |
-| `./bringup_moveit.sh` | display + driver + moveit | v1 joint-space pick (`pick --once HOME`), planner experiments. No camera. |
+| `./bringup_robot.sh` | display + driver | Drag-teach, gripper tuning, raw `/joint_trajectory` testing. No camera. |
 
-All five wrap a single `bringup_pick.sh` with `--profile {pick,calib,vision,robot,moveit}` plus fine-grained `--no-camera` / `--no-marker` / `--no-display` / `--no-driver` / `--no-moveit` overrides. Common flags:
+All four wrap a single `bringup_pick.sh` with `--profile {pick,calib,vision,robot}` plus fine-grained `--no-camera` / `--no-marker` / `--no-display` / `--no-driver` overrides. Common flags:
 
 ```bash
 ./bringup_pick.sh --attach          # bring up + attach to tmux
@@ -137,6 +146,10 @@ ros2 run xarm_pick pick_2d --grip-rad -1.5 --table-z 0.1 \
 ```
 
 Useful flags on `pick_2d`:
+- `--method {cubic|quintic|lspb|trapezoid}` — trajectory profile.
+  `trapezoid` (default) saturates joint-velocity / acceleration
+  limits → fastest. `quintic` has zero acceleration at the boundaries
+  → smoothest.
 - `--no-place` — pick the cube, lift, return to HOME holding it.
 - `--pick-offset DX DY` / `--place-offset DX DY` — constant XY
   bias if you observe a consistent miss.
@@ -155,9 +168,8 @@ Useful flags on `pick_2d`:
 | `src/xarm_pick/xarm_pick/arm_ik.py` | 5-DOF numerical IK. `JOINT_LIMITS` = ±1.5707 to match driver. |
 | `src/xarm_pick/xarm_pick/calibrate_homography.py` | Two-phase pixel→world calibration. |
 | `src/xarm_pick/xarm_pick/pick_2d.py` | Main pick state machine. |
-| `src/xarm_pick/xarm_pick/moveit_client.py` | `MoveGroupClient.move_to_joints` (joint-space goals only). |
-| `src/xarm_moveit_config/config/joint_limits.yaml` | `default_velocity_scaling_factor: 0.30`, accel same. Lower toward 0.05 if motions feel unsafe. |
-| `src/xarm_moveit_config/launch/xarm_1s_moveit.launch.py` | OMPL legacy single-pipeline wiring (params under `ompl.*` namespace). |
+| `src/xarm_pick/xarm_pick/trajectory.py` | Craig/MR profile library: cubic, quintic, LSPB, time-optimal trapezoid. |
+| `src/xarm_pick/xarm_pick/local_traj_client.py` | `FollowJointTrajectory` client. Drives `trajectory.py` profiles to the controller. |
 | `src/charuco_tf_publisher/` | ArUco/ChArUco detector. Use `mode=single_aruco`. |
 | `~/.ros2/xarm_pick/homography.yaml` | Saved calibration: 3×3 H, residuals, suggested table_z. |
 
@@ -170,22 +182,23 @@ Useful flags on `pick_2d`:
   composes as `Rz(π) · Rz(-q6)`.
 - **arm1 is the gripper master**; arm0/arm0_left/arm1_left mimic.
   Commanding only arm1 in a JointTrajectory works.
-- **arm1 is OUTSIDE the MoveIt `arm` planning group**. The SRDF
-  declares `<chain base_link="base_link" tip_link="tool0"/>`,
-  excluding arm1 (a sibling branch off link2). MoveIt does NOT
-  re-plan arm1 during MOVE steps — gripper state persists.
+- **arm1 is the gripper**, driven separately by
+  `xarm_hw.gripper.move_gripper`. The trajectory generator only
+  controls arm2..arm6; arm1 state persists across MOVE steps.
 - **`pick_2d` sends joint-space goals**, not Cartesian. IK runs
-  upfront in `arm_ik.solve_ik`, then `move_to_joints(ik.joints)`
-  hands the joint values to MoveIt. KDL is never invoked.
+  upfront in `arm_ik.solve_ik`; the resulting joints become the goal
+  point for `local_traj_client.move_to_joints`, which builds a
+  Craig/MR profile and posts a `FollowJointTrajectory` action goal.
+  Geometric path is a straight line in joint space — no path planner.
 - **Camera TF chain**: Astra driver publishes
   `camera_link → camera_color_frame → camera_color_optical_frame`.
   Don't add a `world → camera_color_optical_frame` static publisher
   (two-parents conflict). If you ever publish a camera world
   transform, target `world → camera_link`.
-- **MoveIt OMPL config**: Humble's `move_group` reads OMPL params
-  from `ompl.*` at top level (legacy single-pipeline path), not
-  the newer `planning_pipelines.ompl.*` map. Adapter is
-  `AddTimeOptimalParameterization`, not `AddTimeParameterization`.
+- **No obstacle avoidance.** Picks rely on IK producing
+  collision-free joint configurations and the joint-space line
+  between them being safe in this tabletop workspace. Adding scene
+  collision objects would require reinstating a path planner.
 
 ## 9. Known limits / next steps
 

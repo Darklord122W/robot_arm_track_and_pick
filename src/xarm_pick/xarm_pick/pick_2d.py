@@ -34,7 +34,6 @@ from xarm_hw.gripper import ARM1_OPEN_RAD, move_gripper
 
 from .arm_ik import JOINT_ORDER, solve_ik
 from .local_traj_client import LocalTrajectoryClient
-from .moveit_client import MoveGroupClient
 
 
 PUBLISHER_NODE_NAME = '/charuco_tf_publisher'
@@ -178,72 +177,54 @@ def wait_for_cube(node: PickNode, timeout_s: float = 30.0) -> Optional[Tuple[flo
     return None
 
 
-class _Mover:
-    """Adapter that drives waypoints either via MoveIt or via the local
-    Craig/MR trajectory generator + FollowJointTrajectory.
+def _move_to_joints(
+    node: 'PickNode',
+    client: LocalTrajectoryClient,
+    goal: Dict[str, float],
+) -> bool:
+    """Drive a single joint-space waypoint via the local trajectory client.
 
-    The two clients have different needs at call-time: MoveIt's
-    MoveGroup wants only the goal joints (the planner derives the
-    start from /joint_states inside move_group), but the local client
-    wants both the start and the goal so the trajectory can be sized
-    against the actual current pose. This class hides that asymmetry
-    so the pick state-machine can call `move_to_joints(goal)` either
-    way.
+    Reads the freshest /joint_states for the start pose, drops any
+    gripper-master entries from the goal (the controller only knows
+    arm2..arm6), and submits a FollowJointTrajectory goal.
     """
-
-    def __init__(self, node: 'PickNode',
-                 mg: Optional[MoveGroupClient],
-                 local: Optional[LocalTrajectoryClient]):
-        self.node = node
-        self.mg = mg
-        self.local = local
-        if (mg is None) == (local is None):
-            raise ValueError('exactly one of mg / local must be provided')
-
-    def move_to_joints(self, goal: Dict[str, float]) -> bool:
-        if self.mg is not None:
-            return self.mg.move_to_joints(goal)
-        # Local path: read the most recent /joint_states for q_start.
-        # Spin briefly to give the subscription a chance to update if
-        # we just finished a previous move.
-        deadline = time.monotonic() + 1.0
-        q_start = self.node.current_arm_q()
-        while q_start is None and time.monotonic() < deadline:
-            rclpy.spin_once(self.node, timeout_sec=0.05)
-            q_start = self.node.current_arm_q()
-        if q_start is None:
-            self.node.get_logger().error(
-                'LocalTraj: no /joint_states received — cannot determine q_start'
-            )
-            return False
-        # The goal dict may include arm1 (gripper); strip to controller joints.
-        controller_joints = self.local.joint_names
-        q_start_filtered = {n: q_start[n] for n in controller_joints if n in q_start}
-        q_goal_filtered  = {n: goal[n]    for n in controller_joints if n in goal}
-        if len(q_goal_filtered) != len(controller_joints):
-            missing = set(controller_joints) - set(q_goal_filtered)
-            self.node.get_logger().error(
-                f'LocalTraj: goal missing joints {sorted(missing)}'
-            )
-            return False
-        return self.local.move_to_joints(q_start_filtered, q_goal_filtered)
+    deadline = time.monotonic() + 1.0
+    q_start = node.current_arm_q()
+    while q_start is None and time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+        q_start = node.current_arm_q()
+    if q_start is None:
+        node.get_logger().error(
+            'LocalTraj: no /joint_states received — cannot determine q_start'
+        )
+        return False
+    controller_joints = client.joint_names
+    q_start_filtered = {n: q_start[n] for n in controller_joints if n in q_start}
+    q_goal_filtered  = {n: goal[n]    for n in controller_joints if n in goal}
+    if len(q_goal_filtered) != len(controller_joints):
+        missing = set(controller_joints) - set(q_goal_filtered)
+        node.get_logger().error(
+            f'LocalTraj: goal missing joints {sorted(missing)}'
+        )
+        return False
+    return client.move_to_joints(q_start_filtered, q_goal_filtered)
 
 
 def run_pick_cycle(
     node: 'PickNode',
-    mover: '_Mover',
+    client: LocalTrajectoryClient,
     H: np.ndarray,
     table_z: float,
     args: argparse.Namespace,
 ) -> int:
     """Run one detect → IK → pick → (optional place) cycle.
 
-    Setup (`rclpy.init`, the node, the MoveGroupClient.wait_for_server,
-    and any marker_id switch) must already be done. Returns an exit
-    code (0 = success). Reads per-pick parameters from `args`:
-      place, marker_frame, camera_frame, cube_timeout, pos_tol,
-      tilt_tol_deg, pick_offset, place_offset, approach_height,
-      lift_height, grip_rad, no_execute, no_place, pause_at_pre_grasp.
+    Setup (`rclpy.init`, the node, the trajectory client's
+    wait_for_server, and any marker_id switch) must already be done.
+    Returns an exit code (0 = success). Reads per-pick parameters
+    from `args`: place, marker_frame, camera_frame, cube_timeout,
+    pos_tol, tilt_tol_deg, pick_offset, place_offset, approach_height,
+    lift_height, grip_rad, no_execute, no_place, pause_at_pre_grasp.
 
     Updates `node.marker_frame` so multiple calls with different
     --marker-frame values track different cubes within one process.
@@ -337,7 +318,7 @@ def run_pick_cycle(
 
     for name, pos, ik in solved:
         print(f'-> {name} ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f})')
-        if not mover.move_to_joints(ik.joints):
+        if not _move_to_joints(node, client, ik.joints):
             print(f'  {name} plan/execute failed; aborting')
             return 5
         time.sleep(0.3)
@@ -362,7 +343,7 @@ def run_pick_cycle(
         print('-> HOME (joints all zero, holding cube)')
         home_joints = {'arm2': 0.0, 'arm3': 0.0, 'arm4': 0.0,
                        'arm5': 0.0, 'arm6': 0.0}
-        if not mover.move_to_joints(home_joints):
+        if not _move_to_joints(node, client, home_joints):
             print('  HOME plan/execute failed')
             return 9
 
@@ -423,18 +404,12 @@ def main():
                     help='Skip the place phase: pick the cube, lift, then '
                          'return to HOME (joints all zero) holding the cube. '
                          'Gripper stays closed at the end.')
-    ap.add_argument('--local-trajgen', action='store_true',
-                    help='Bypass MoveIt and drive the controller directly '
-                         'with the from-scratch trajectory generator '
-                         '(Craig §7 / MR §9). Geometric path = straight '
-                         'line in joint space; time scaling = --trajgen-method.')
-    ap.add_argument('--trajgen-method', default='trapezoid',
+    ap.add_argument('--method', default='trapezoid',
                     choices=['cubic', 'quintic', 'lspb', 'trapezoid'],
-                    help='Time-scaling profile when --local-trajgen is set. '
-                         'cubic/quintic = polynomial point-to-point '
-                         '(Craig §7.3/7.4), lspb = linear with parabolic '
-                         'blends (Craig §7.5), trapezoid = time-optimal '
-                         'along the joint-space line (MR §9.4).')
+                    help='Trajectory profile. cubic/quintic = polynomial '
+                         'point-to-point (Craig §7.3/7.4), lspb = linear '
+                         'with parabolic blends (Craig §7.5), trapezoid = '
+                         'time-optimal along the joint-space line (MR §9.4).')
     args = ap.parse_args()
 
     if not args.homography.exists():
@@ -452,23 +427,12 @@ def main():
     rclpy.init()
     node = PickNode(marker_frame=args.marker_frame, camera_frame=args.camera_frame)
     try:
-        if args.local_trajgen:
-            local = LocalTrajectoryClient(node, method=args.trajgen_method)
-            if not local.wait_for_server(timeout_s=10.0):
-                print(f'ERROR: FollowJointTrajectory action server not '
-                      f'available at {local._action_name} — is xarm_hw '
-                      f'driver running?')
-                return 2
-            mover = _Mover(node, mg=None, local=local)
-            print(f'Trajectory generator: local ({args.trajgen_method}, '
-                  f'Craig/MR style — bypasses MoveIt)')
-        else:
-            mg = MoveGroupClient(node)
-            if not mg.wait_for_server(timeout_s=10.0):
-                print('ERROR: MoveGroup action server not available — is '
-                      'move_group running?')
-                return 2
-            mover = _Mover(node, mg=mg, local=None)
+        client = LocalTrajectoryClient(node, method=args.method)
+        if not client.wait_for_server(timeout_s=10.0):
+            print(f'ERROR: FollowJointTrajectory action server not '
+                  f'available — is xarm_hw_driver running?')
+            return 2
+        print(f'Trajectory profile: {args.method} (Craig/MR style)')
 
         if args.marker_id is not None:
             print(f'Switching publisher to marker_id={args.marker_id}...')
@@ -478,7 +442,7 @@ def main():
             # before wait_for_cube starts polling.
             time.sleep(0.5)
 
-        return run_pick_cycle(node, mover, H, table_z, args)
+        return run_pick_cycle(node, client, H, table_z, args)
     finally:
         node.destroy_node()
         rclpy.shutdown()

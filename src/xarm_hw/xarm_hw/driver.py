@@ -24,7 +24,7 @@ class XArmHardwareDriver(Node):
         # ------------------ hardware connection ------------------
         self.arm = xarm.Controller("USB")
         self.get_logger().info("Connected to xArm over USB")
-        self.get_logger().info("=== XArmHardwareDriver VERSION 2 (MoveIt Action) ===")
+        self.get_logger().info("=== XArmHardwareDriver (FollowJointTrajectory action server) ===")
         self.get_logger().info(
             f"driver.py loaded from: {inspect.getfile(XArmHardwareDriver)}"
         )
@@ -36,11 +36,11 @@ class XArmHardwareDriver(Node):
             self.get_parameter('fallback_peak_velocity_rad_s').value
         )
         self.get_logger().info(
-            f"Fallback peak velocity (used when MoveIt sends zero-time traj): "
+            f"Fallback peak velocity (used if a goal arrives without timestamps): "
             f"{self.fallback_peak_v:.3f} rad/s"
         )
 
-        # ROS joint names from URDF / SRDF / MoveIt
+        # ROS joint names from the URDF.
         self.joint_names = ["arm1", "arm2", "arm3", "arm4", "arm5", "arm6"]
 
         # Mapping from ROS joint name to servo ID on the real robot
@@ -76,8 +76,8 @@ class XArmHardwareDriver(Node):
         self.current_positions = [0.0] * len(self.joint_names)
 
         # ------------------ (optional) topic subscriber ------------------
-        # Still keep the /joint_trajectory subscriber for manual testing,
-        # but MoveIt will not use this; it will use the ActionServer below.
+        # Still keep the /joint_trajectory subscriber for manual testing.
+        # The pick stack uses the FollowJointTrajectory action below instead.
         self.cmd_sub = self.create_subscription(
             JointTrajectory,
             'joint_trajectory',
@@ -107,8 +107,8 @@ class XArmHardwareDriver(Node):
         )
 
         # ------------------ FollowJointTrajectory Action Server ------------------
-        # This name must match moveit_controllers.yaml:
-        #   xarm_1s_arm_controller + action_ns: follow_joint_trajectory
+        # Action namespace `xarm_1s_arm_controller/follow_joint_trajectory`
+        # is the contract with xarm_pick.local_traj_client; keep stable.
         self._action_server = ActionServer(
             self,
             FollowJointTrajectory,
@@ -179,7 +179,7 @@ class XArmHardwareDriver(Node):
         current value (used by the gripper CLI to command arm1 alone).
         Uses the final point's time_from_start as the move duration;
         falls back to 500 ms when the field is zero.
-        MoveIt uses the FollowJointTrajectory action below, not this path.
+        The pick stack uses the FollowJointTrajectory action below.
         """
         if not msg.points:
             return
@@ -202,11 +202,10 @@ class XArmHardwareDriver(Node):
         self.send_joint_positions(target, duration_ms=duration_ms)
 
     # ======================================================================
-    #  FollowJointTrajectory Action callbacks (used by MoveIt)
+    #  FollowJointTrajectory Action callbacks
     # ======================================================================
 
     def goal_callback(self, goal_request):
-        # Always accept goals from MoveIt
         self.get_logger().info('Received new FollowJointTrajectory goal')
         return GoalResponse.ACCEPT
 
@@ -216,10 +215,10 @@ class XArmHardwareDriver(Node):
 
     def execute_trajectory_cb(self, goal_handle):
         """
-        Execute a FollowJointTrajectory goal from MoveIt.
-        We step through each point in order, sending commands with appropriate timing.
+        Execute a FollowJointTrajectory goal.
+        Step through each point in order, sending commands with appropriate timing.
         """
-        self.get_logger().info('Executing trajectory from MoveIt')
+        self.get_logger().info('Executing trajectory')
 
         traj = goal_handle.request.trajectory
 
@@ -228,7 +227,7 @@ class XArmHardwareDriver(Node):
             goal_handle.succeed()
             return FollowJointTrajectory.Result()
 
-        # --- DIAGNOSTIC: dump trajectory shape so we can see what speed MoveIt sent ---
+        # --- DIAGNOSTIC: dump trajectory shape ---
         last_t = traj.points[-1].time_from_start
         last_dur_s = last_t.sec + last_t.nanosec * 1e-9
         first_t = traj.points[0].time_from_start
@@ -244,7 +243,7 @@ class XArmHardwareDriver(Node):
         )
         # --- END DIAGNOSTIC ---
 
-        # Fallback: if MoveIt didn't time-parameterize the trajectory (last_t == 0),
+        # Fallback: if the goal arrived without time-parameterisation (last_t == 0),
         # synthesise per-segment timing here at a fixed target peak velocity. Without
         # this the loop below sees segment_dt=0 on every point and races the servo
         # at full speed regardless of any RViz/YAML scaling.
@@ -265,7 +264,7 @@ class XArmHardwareDriver(Node):
                     (cumulative - int(cumulative)) * 1e9
                 )
             self.get_logger().warn(
-                f"Trajectory had zero time_from_start (TOTG didn't run). "
+                f"Trajectory had zero time_from_start. "
                 f"Recomputed timing: total={cumulative:.2f}s at peak_v={TARGET_PEAK_V:.3f}rad/s."
             )
 
@@ -300,7 +299,7 @@ class XArmHardwareDriver(Node):
                     pass
 
             # Compute move duration for this segment.
-            # Cadence: how often we send a new setPosition (= TOTG output dt).
+            # Cadence: how often we send a new setPosition (= sender's dt).
             # Duration: how long the servo is told the move should take.
             #
             # duration ≈ 1.5× cadence: the servo finishes 2/3 of each ramp

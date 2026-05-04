@@ -4,15 +4,14 @@ v1: hardcoded joint waypoints. The user hand-tunes them so that
 GRASP places the gripper around a cube on the table. The live 2D
 homography pick is in pick_2d.py.
 
-State sequence (each MOVE plans through MoveGroup over arm2..arm6;
-each GRIPPER publishes a single-arm1 trajectory):
+State sequence (each MOVE goes through the local trajectory generator
+over arm2..arm6; each GRIPPER publishes a single-arm1 trajectory):
 
     HOME -> open -> PRE_GRASP -> GRASP -> grip
          -> LIFT -> PLACE -> open -> HOME
 
-arm1 is NOT in the MoveIt planning group (the SRDF declares `arm`
-as a chain base_link→tool0, which excludes the arm1 sibling branch).
-arm1 is set by 'gripper' steps and persists across MOVE steps.
+arm1 is the gripper master and is driven separately by xarm_hw.gripper;
+it is not part of the planning chain.
 
 CLI:
     ros2 run xarm_pick pick                   # full sequence
@@ -20,16 +19,18 @@ CLI:
     ros2 run xarm_pick pick --once GRASP      # just go to GRASP
     ros2 run xarm_pick pick --grip-rad -1.5   # tune gripper grip
     ros2 run xarm_pick pick --skip-gripper    # MOVE-only dry run
+    ros2 run xarm_pick pick --method quintic  # smoother profile
 """
 from __future__ import annotations
 
 import argparse
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 
 from xarm_hw.gripper import (
     ARM1_CLOSED_RAD,
@@ -37,18 +38,14 @@ from xarm_hw.gripper import (
     move_gripper,
 )
 
-from .moveit_client import MoveGroupClient
+from .local_traj_client import LocalTrajectoryClient
 
 
 # Default grip closure for a 40 mm cube; tune via --grip-rad.
 DEFAULT_GRIP_RAD = -1.5
 
 # Joint-space waypoints (arm2..arm6 only — arm1 is the gripper master,
-# controlled by the 'gripper' steps via xarm_hw.gripper, not by MoveIt).
-# Reasonable starting values — hand-tune for your rig:
-#   1. ros2 run xarm_pick pick --once HOME       # confirm HOME safe
-#   2. drag-teach the arm to PRE_GRASP, read joint_states, edit here
-#   3. repeat for GRASP / LIFT / PLACE
+# controlled by the 'gripper' steps via xarm_hw.gripper).
 DEFAULT_POSES: Dict[str, Dict[str, float]] = {
     'HOME':      {'arm2': 0.0, 'arm3':  0.0, 'arm4':  0.0, 'arm5':  0.0, 'arm6':  0.0},
     'PRE_GRASP': {'arm2': 1.0, 'arm3':  0.5, 'arm4':  0.5, 'arm5':  0.0, 'arm6':  0.0},
@@ -71,12 +68,28 @@ SEQUENCE: List[Tuple[str, str]] = [
 ]
 
 
-def resolve_pose(pose: Dict[str, float], grip_rad: float) -> Dict[str, float]:
-    """Pass-through. arm1 is no longer in the planning group, so no
-    joint-target patching is needed; grip_rad is unused here but kept
-    for backward compat with the call sites."""
-    del grip_rad  # explicitly unused
-    return {joint: float(value) for joint, value in pose.items()}
+class _JointStateNode(Node):
+    """Tiny rclpy node that just tracks the latest /joint_states.
+
+    LocalTrajectoryClient.move_to_joints needs the current joint
+    positions as the trajectory's start point; we subscribe here so
+    every MOVE step can read the freshest values without each call
+    re-creating its own subscription.
+    """
+
+    def __init__(self):
+        super().__init__('pick_node')
+        self._latest: Dict[str, float] = {}
+        self.create_subscription(JointState, '/joint_states', self._cb, 10)
+
+    def _cb(self, msg: JointState) -> None:
+        for n, p in zip(msg.name, msg.position):
+            self._latest[n] = float(p)
+
+    def current_q(self, joint_names: List[str]) -> Optional[Dict[str, float]]:
+        if not all(n in self._latest for n in joint_names):
+            return None
+        return {n: self._latest[n] for n in joint_names}
 
 
 def gripper_target(name: str, grip_rad: float) -> float:
@@ -89,9 +102,20 @@ def gripper_target(name: str, grip_rad: float) -> float:
     raise ValueError(f'unknown gripper step: {name!r}')
 
 
+def _wait_for_q(node: _JointStateNode, joint_names: List[str],
+                timeout_s: float = 2.0) -> Optional[Dict[str, float]]:
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+        rclpy.spin_once(node, timeout_sec=0.05)
+        q = node.current_q(joint_names)
+        if q is not None:
+            return q
+    return None
+
+
 def run_sequence(
-    node: Node,
-    mg: MoveGroupClient,
+    node: _JointStateNode,
+    client: LocalTrajectoryClient,
     sequence: List[Tuple[str, str]],
     poses: Dict[str, Dict[str, float]],
     grip_rad: float,
@@ -101,8 +125,13 @@ def run_sequence(
     for step_type, name in sequence:
         node.get_logger().info(f'>>> {step_type} {name}')
         if step_type == 'move':
-            target = resolve_pose(poses[name], grip_rad)
-            if not mg.move_to_joints(target):
+            q_start = _wait_for_q(node, client.joint_names)
+            if q_start is None:
+                node.get_logger().error(
+                    'no /joint_states received — is xarm_hw_driver running?'
+                )
+                return False
+            if not client.move_to_joints(q_start, poses[name]):
                 node.get_logger().error(f'move to {name} failed; aborting')
                 return False
         elif step_type == 'gripper':
@@ -126,26 +155,32 @@ def main():
                    help='Skip the full sequence; just MOVE to this named pose')
     p.add_argument('--grip-rad', type=float, default=DEFAULT_GRIP_RAD,
                    help=f'arm1 angle (rad) used for "grip" step '
-                        f'and for LIFT/PLACE while holding (default {DEFAULT_GRIP_RAD})')
+                        f'(default {DEFAULT_GRIP_RAD})')
     p.add_argument('--skip-gripper', action='store_true',
                    help='Skip gripper steps — useful for MOVE-only dry runs')
     p.add_argument('--settle-sec', type=float, default=0.5,
                    help='Seconds to pause between steps (default 0.5)')
+    p.add_argument('--method', default='trapezoid',
+                   choices=['cubic', 'quintic', 'lspb', 'trapezoid'],
+                   help='Trajectory profile (Craig §7 / MR §9.4). '
+                        'trapezoid (default) is time-optimal.')
     args = p.parse_args()
 
     rclpy.init()
-    node = Node('pick_node')
+    node = _JointStateNode()
     try:
-        mg = MoveGroupClient(node)
-        node.get_logger().info('Waiting for MoveGroup action server (/move_action)...')
-        if not mg.wait_for_server(timeout_s=10.0):
+        client = LocalTrajectoryClient(node, method=args.method)
+        node.get_logger().info(
+            f'Waiting for FollowJointTrajectory action server '
+            f'(method={args.method})...'
+        )
+        if not client.wait_for_server(timeout_s=10.0):
             node.get_logger().error(
-                'MoveGroup action server not available — is the move_group '
-                'node running? Try: ros2 launch xarm_moveit_config '
-                'xarm_1s_moveit.launch.py'
+                'FollowJointTrajectory action server not available — '
+                'is xarm_hw_driver running?'
             )
             return 1
-        node.get_logger().info('MoveGroup ready.')
+        node.get_logger().info('Controller ready.')
 
         if args.once:
             if args.once not in DEFAULT_POSES:
@@ -153,11 +188,14 @@ def main():
                     f'unknown pose {args.once!r}; available: {list(DEFAULT_POSES)}'
                 )
                 return 2
-            target = resolve_pose(DEFAULT_POSES[args.once], args.grip_rad)
-            return 0 if mg.move_to_joints(target) else 3
+            q_start = _wait_for_q(node, client.joint_names)
+            if q_start is None:
+                node.get_logger().error('no /joint_states received')
+                return 5
+            return 0 if client.move_to_joints(q_start, DEFAULT_POSES[args.once]) else 3
 
         ok = run_sequence(
-            node, mg, SEQUENCE, DEFAULT_POSES,
+            node, client, SEQUENCE, DEFAULT_POSES,
             grip_rad=args.grip_rad,
             skip_gripper=args.skip_gripper,
             settle_s=args.settle_sec,

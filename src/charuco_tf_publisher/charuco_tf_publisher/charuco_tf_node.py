@@ -3,8 +3,9 @@
 Subscribes to a color image + camera_info topic, detects either a full
 ChArUco board or a single ArUco marker (selected by the `mode` parameter),
 and broadcasts the fiducial pose as a TF transform from the camera optical
-frame to a configurable child frame. Designed to feed easy_handeye2 as the
-tracking_marker_frame source.
+frame to a configurable child frame. The pick stack (xarm_pick.pick_2d)
+consumes this TF, projects the marker translation through K to a pixel,
+and applies the saved homography to get world XY.
 
 Modes:
   - 'charuco' (default): detect a multi-marker + checker ChArUco board.
@@ -19,7 +20,9 @@ Modes:
 
 Both modes broadcast `parent_frame -> child_frame` (default
 `camera_color_optical_frame -> handeye_target`) at the rate of the input
-image stream.
+image stream. The frame name `handeye_target` is historical (from the
+abandoned full hand-eye calibration approach); it now just labels the
+detected cube marker.
 """
 
 import math
@@ -121,11 +124,10 @@ class CharucoTFNode(Node):
         self.declare_parameter('use_prior_disambiguation', False)
         self.declare_parameter('prior_robot_frame', 'link2')
         self.declare_parameter('prior_world_frame', 'world')
-        # Default prior: latest saved easy_handeye2 calibration values from
-        # `~/.ros2/easy_handeye2/calibrations/xarm_handeye.calib` (iter27).
-        # iter23's CLAUDE.md values produced systematically wrong picks in
-        # iter31, possibly because the camera moved. iter27 is at least
-        # in the same hemisphere as the live arrangement.
+        # Default prior values come from the abandoned hand-eye era;
+        # kept only as a sanity-check reference if `use_prior_disambiguation`
+        # is ever re-enabled. The pick stack ignores this branch by default
+        # (the depth-fusion disambiguator + sticky-history work fine).
         self.declare_parameter('prior_world_to_camera_xyz',
                                [-0.0113, 0.0554, 1.0988])
         self.declare_parameter('prior_world_to_camera_qxyzw',

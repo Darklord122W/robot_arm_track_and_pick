@@ -38,7 +38,7 @@ import numpy as np
 import rclpy
 import yaml
 
-from .moveit_client import MoveGroupClient
+from .local_traj_client import LocalTrajectoryClient
 from .pick_2d import (
     DEFAULT_APPROACH_HEIGHT_M,
     DEFAULT_CAMERA_FRAME,
@@ -98,6 +98,9 @@ def main():
     ap.add_argument('--place-offset', nargs=2, type=float, default=[0.0, 0.0],
                     metavar=('DX', 'DY'))
     ap.add_argument('--pause-at-pre-grasp', type=float, default=0.0)
+    ap.add_argument('--method', default='trapezoid',
+                    choices=['cubic', 'quintic', 'lspb', 'trapezoid'],
+                    help='Trajectory profile (Craig §7 / MR §9.4).')
     args = ap.parse_args()
 
     if not args.homography.exists():
@@ -122,9 +125,10 @@ def main():
     node = PickNode(marker_frame=args.marker_frame,
                     camera_frame=args.camera_frame)
     try:
-        mg = MoveGroupClient(node)
-        if not mg.wait_for_server(timeout_s=10.0):
-            print('ERROR: MoveGroup action server not available.')
+        client = LocalTrajectoryClient(node, method=args.method)
+        if not client.wait_for_server(timeout_s=10.0):
+            print('ERROR: FollowJointTrajectory action server not available — '
+                  'is xarm_hw_driver running?')
             return 2
 
         n_ok = 0
@@ -148,7 +152,7 @@ def main():
             task_args.place = [place_x, place_y]
             task_args.no_place = False
 
-            rc = run_pick_cycle(node, mg, H, table_z, task_args)
+            rc = run_pick_cycle(node, client, H, table_z, task_args)
             if rc == 0:
                 n_ok += 1
             else:
